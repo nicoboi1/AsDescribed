@@ -1,0 +1,11 @@
+{
+  "network": "testnet-bradbury",
+  "chainId": 4221,
+  "sender": "0xEe293185Ade625BEB6a888712b403943cD65e71c",
+  "contractAddress": "0x70786c835A0FFB1A7ea6A212dfbf7e59cbA20b99",
+  "transactionHash": "0x11fa7a0b9fe5458cb3034738a512e3b13e2dc9bb8e8fb3c3abe7accedfbf4f16",
+  "status": "ACCEPTED",
+  "executionResult": "FINISHED_WITH_RETURN",
+  "schemaMethodCount": 11,
+  "deployedAt": "2026-07-19T14:37:18.803Z"
+}
