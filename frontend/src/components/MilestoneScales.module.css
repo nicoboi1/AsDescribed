@@ -1,1 +1,19 @@
-﻿.wrap {  display: flex;  flex-direction: column;  align-items: center;  gap: 12px;}.svg {  width: 100%;  max-width: 280px;  height: auto;}.legend {  display: grid;  grid-template-columns: 1fr 1fr;  gap: 4px 14px;  width: 100%;}.item {  display: flex;  align-items: center;  gap: 7px;  font-family: var(--mono);  font-size: 10px;  text-transform: uppercase;  letter-spacing: 0.08em;  color: var(--ink-faint);}.item i {  width: 8px;  height: 8px;  border-radius: 2px;  opacity: 0.55;  flex: none;}.item em {  font-style: normal;  width: 12px;  color: var(--ink-faint);}.item.active {  color: var(--ink);  font-weight: 600;}.item.active i {  opacity: 1;}
+.wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.svg {
+  width: 100%;
+  height: auto;
+}
+.foot {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-faint);
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}

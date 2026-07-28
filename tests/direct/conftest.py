@@ -1,1 +1,59 @@
-﻿"""Windows compatibility for genlayer-test direct mode."""import osimport tempfileimport pytest@pytest.fixture(scope="session", autouse=True)def windows_genlayer_stdin_compatibility():    if os.name != "nt":        yield        return    from gltest.direct import loader    original_inject = loader._inject_message_to_fd0    pending_paths: list[str] = []    def inject_without_early_unlink(vm):        from genlayer.py import calldata        from genlayer.py.types import Address        def as_address(value):            return Address(value) if isinstance(value, bytes) else value        encoded = calldata.encode(            {                "contract_address": as_address(vm._contract_address),                "sender_address": as_address(vm.sender),                "origin_address": as_address(vm.origin),                "stack": [],                "value": vm._value,                "datetime": vm._datetime,                "is_init": False,                "chain_id": vm._chain_id,                "entry_kind": 0,                "entry_data": b"",                "entry_stage_data": None,            }        )        fd, path = tempfile.mkstemp()        os.write(fd, encoded)        os.lseek(fd, 0, os.SEEK_SET)        vm._original_stdin_fd = os.dup(0)        os.dup2(fd, 0)        os.close(fd)        pending_paths.append(path)    loader._inject_message_to_fd0 = inject_without_early_unlink    try:        yield    finally:        loader._inject_message_to_fd0 = original_inject        for path in pending_paths:            try:                os.unlink(path)            except FileNotFoundError:                pass
+"""Windows compatibility for genlayer-test direct mode."""
+
+import os
+import tempfile
+
+import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def windows_genlayer_stdin_compatibility():
+    if os.name != "nt":
+        yield
+        return
+
+    from gltest.direct import loader
+
+    original_inject = loader._inject_message_to_fd0
+    pending_paths: list[str] = []
+
+    def inject_without_early_unlink(vm):
+        from genlayer.py import calldata
+        from genlayer.py.types import Address
+
+        def as_address(value):
+            return Address(value) if isinstance(value, bytes) else value
+
+        encoded = calldata.encode(
+            {
+                "contract_address": as_address(vm._contract_address),
+                "sender_address": as_address(vm.sender),
+                "origin_address": as_address(vm.origin),
+                "stack": [],
+                "value": vm._value,
+                "datetime": vm._datetime,
+                "is_init": False,
+                "chain_id": vm._chain_id,
+                "entry_kind": 0,
+                "entry_data": b"",
+                "entry_stage_data": None,
+            }
+        )
+        fd, path = tempfile.mkstemp()
+        os.write(fd, encoded)
+        os.lseek(fd, 0, os.SEEK_SET)
+        vm._original_stdin_fd = os.dup(0)
+        os.dup2(fd, 0)
+        os.close(fd)
+        pending_paths.append(path)
+
+    loader._inject_message_to_fd0 = inject_without_early_unlink
+    try:
+        yield
+    finally:
+        loader._inject_message_to_fd0 = original_inject
+        for path in pending_paths:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass

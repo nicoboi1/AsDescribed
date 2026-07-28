@@ -1,1 +1,125 @@
-﻿.nav {  position: sticky;  top: 0;  z-index: 40;  background: linear-gradient(    var(--parchment) 60%,    rgba(246, 242, 233, 0.72)  );  backdrop-filter: blur(12px);  border-bottom: 1px solid var(--line);}.inner {  height: var(--nav-h);  display: flex;  align-items: center;  justify-content: space-between;  gap: 18px;}.brand {  display: flex;  align-items: center;  gap: 11px;  background: none;  border: 0;  padding: 0;}.glyph {  font-size: 22px;  color: var(--brass-dim);  line-height: 1;}.brandText {  display: flex;  flex-direction: column;  align-items: flex-start;  line-height: 1.05;}.brandText b {  font-family: var(--serif);  font-weight: 600;  font-size: 18px;  letter-spacing: -0.01em;}.brandText i {  font-family: var(--mono);  font-style: normal;  font-size: 9px;  text-transform: uppercase;  letter-spacing: 0.26em;  color: var(--ink-faint);}@media (max-width: 560px) {  .brandText i {    display: none;  }}.links {  display: flex;  gap: 6px;  position: absolute;  left: 50%;  transform: translateX(-50%);}@media (max-width: 760px) {  .links {    position: static;    transform: none;  }}.link {  position: relative;  background: none;  border: 0;  font-family: var(--serif);  font-size: 15px;  color: var(--ink-soft);  padding: 8px 6px;  transition: color 0.3s var(--ease);}.link:hover {  color: var(--ink);}.link.active {  color: var(--ink);}.link.active::after {  content: "";  position: absolute;  left: 6px;  right: 6px;  bottom: 2px;  height: 2px;  background: var(--brass);  border-radius: 2px;}.right {  display: flex;  align-items: center;  gap: 14px;}.net {  font-family: var(--mono);  font-size: 10px;  text-transform: uppercase;  letter-spacing: 0.18em;  color: var(--ink-faint);  display: inline-flex;  align-items: center;  gap: 7px;}.net i {  width: 6px;  height: 6px;  border-radius: 50%;  background: var(--brass);  box-shadow: 0 0 0 3px rgba(184, 134, 11, 0.2);}@media (max-width: 880px) {  .net {    display: none;  }}
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: linear-gradient(
+    var(--parchment) 60%,
+    rgba(246, 242, 233, 0.72)
+  );
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.inner {
+  height: var(--nav-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: none;
+  border: 0;
+  padding: 0;
+}
+.glyph {
+  font-size: 22px;
+  color: var(--brass-dim);
+  line-height: 1;
+}
+.brandText {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  line-height: 1.05;
+}
+.brandText b {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 18px;
+  letter-spacing: -0.01em;
+}
+.brandText i {
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.26em;
+  color: var(--ink-faint);
+}
+@media (max-width: 560px) {
+  .brandText i {
+    display: none;
+  }
+}
+
+.links {
+  display: flex;
+  gap: 6px;
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+@media (max-width: 760px) {
+  .links {
+    position: static;
+    transform: none;
+  }
+}
+.link {
+  position: relative;
+  background: none;
+  border: 0;
+  font-family: var(--serif);
+  font-size: 15px;
+  color: var(--ink-soft);
+  padding: 8px 6px;
+  transition: color 0.3s var(--ease);
+}
+.link:hover {
+  color: var(--ink);
+}
+.link.active {
+  color: var(--ink);
+}
+.link.active::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 2px;
+  height: 2px;
+  background: var(--brass);
+  border-radius: 2px;
+}
+
+.right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.net {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ink-faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.net i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brass);
+  box-shadow: 0 0 0 3px rgba(184, 134, 11, 0.2);
+}
+@media (max-width: 880px) {
+  .net {
+    display: none;
+  }
+}

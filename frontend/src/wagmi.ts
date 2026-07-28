@@ -1,1 +1,14 @@
-﻿import { getDefaultConfig } from "@rainbow-me/rainbowkit";import { studionet } from "./chains";// WalletConnect projectId. Injected wallets (MetaMask / Rabby) work without a// real one; set VITE_WC_PROJECT_ID to enable WalletConnect.const projectId =  (import.meta.env.VITE_WC_PROJECT_ID as string | undefined) || "GENLAYER_LOCAL";export const wagmiConfig = getDefaultConfig({  appName: "Stone & Scales ÔÇö Escrow Arbiter",  projectId,  chains: [studionet],  ssr: false,});
+import { getDefaultConfig } from "@rainbow-me/rainbowkit";
+import { bradbury } from "./chains";
+
+// WalletConnect projectId. Injected wallets (MetaMask / Rabby) work without a
+// real one; set VITE_WC_PROJECT_ID to enable WalletConnect.
+const projectId =
+  (import.meta.env.VITE_WC_PROJECT_ID as string | undefined) || "GENLAYER_LOCAL";
+
+export const wagmiConfig = getDefaultConfig({
+  appName: "Stone & Scales — Escrow Arbiter",
+  projectId,
+  chains: [bradbury],
+  ssr: false,
+});

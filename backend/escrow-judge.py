@@ -1,1 +1,1266 @@
-﻿# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }"""Multi-party escrow with milestone tranches and on-call arbitration.This is the `escrow-judge` contract from the 04-onyx hub. It is aWORKFLOW contract ÔÇö its sole responsibility is to coordinate theincremental release of escrowed value across a sequence of milestones,each gated by per-role approvals and arbitrated when disputed.Operation type: WORKFLOW========================Every deal moves through a sequence of milestones. Each milestone hasa declared share of the total escrow value. A milestone releases itstranche only when its prerequisites have been ticked off by the rightroles (Buyer signs off; optional Witness attestation; Seller's releaserequest). Disputes pause the milestone and route to a small arbiterjury whose findings are synthesized by an LLM into a final verdict.Architectural style: multi-actor role registry==============================================Every deal has its own role binding map. The same address can be aBuyer in one deal and an Arbiter in another. Every privileged methodcalls `_require_role(deal_id, allowed_tuple)` as its first statement.Phase is checked second.Non-determinism budget======================  * 3 distinct LLM call sites:      - `_llm_milestone_coherence` inside `attest_milestone`      - `_llm_dispute_summary`     inside `open_dispute`      - `_llm_jury_verdict`        inside `finalize_dispute`  * 2 distinct web-fetch lambdas:      - `_fetch_milestones_doc`    inside `open_deal`      - `_fetch_evidence_bundle`   inside `finalize_dispute`  * Custom reconciliation helper `_agree_on_split`.Public surface==============Writes (16): open_deal, accept_deal, add_witness, declare_milestone,             attest_milestone, request_release, release_milestone,             open_dispute, assign_arbiter, file_arbiter_finding,             finalize_dispute, recover_timed_out_dispute,             claim_seller_payout, claim_buyer_refund,             claim_dispute_bond, void_deal.Views   (7): deal, milestones, role_of, participants, dispute,             tranche_state, platform_summary.Error envelope==============English-narrative refusals:  denied: ROLE cannot ACTION in PHASE  escrow: NARRATIVE  arbitration: NARRATIVE  llm: NARRATIVE  fetch: NARRATIVE (transient|permanent)"""import hashlibimport jsonfrom collections import defaultdictfrom dataclasses import dataclass, fieldfrom datetime import datetime, timezonefrom enum import IntEnumfrom genlayer import *# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 1. CONSTANTS# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉPHASE_AWAITING_FUND   = "AWAITING_FUND"PHASE_FUNDED          = "FUNDED"PHASE_IN_PROGRESS     = "IN_PROGRESS"PHASE_MILESTONE_REVIEW = "MILESTONE_REVIEW"PHASE_DISPUTED        = "DISPUTED"PHASE_ARBITRATING     = "ARBITRATING"PHASE_SETTLING        = "SETTLING"PHASE_CLOSED          = "CLOSED"PHASE_VOID            = "VOID"PHASES_ALL = (    PHASE_AWAITING_FUND, PHASE_FUNDED, PHASE_IN_PROGRESS,    PHASE_MILESTONE_REVIEW, PHASE_DISPUTED, PHASE_ARBITRATING,    PHASE_SETTLING, PHASE_CLOSED, PHASE_VOID,)VERDICT_BUYER_WINS = "BUYER_WINS"VERDICT_SELLER_WINS = "SELLER_WINS"VERDICT_SPLIT = "SPLIT"VERDICT_RECOVERY_REFUND = "RECOVERY_REFUND"VERDICT_VALUES = (VERDICT_BUYER_WINS, VERDICT_SELLER_WINS, VERDICT_SPLIT)QUORUM_ARBITERS = 1   # minimum arbiter findings before LLM can finalizeSPLIT_BPS_TOLERANCE = 500  # validator agreement band on split bpsDISPUTE_RECOVERY_TIMEOUT_SECONDS = 7 * 24 * 60 * 60# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 2. ROLES# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉclass Role(IntEnum):    NONE     = 0    BUYER    = 1    SELLER   = 2    WITNESS  = 3    ARBITER  = 4    PLATFORM = 5ROLE_NAMES = {    int(Role.NONE):     "NONE",    int(Role.BUYER):    "BUYER",    int(Role.SELLER):   "SELLER",    int(Role.WITNESS):  "WITNESS",    int(Role.ARBITER):  "ARBITER",    int(Role.PLATFORM): "PLATFORM",}# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 3. ERROR HELPERS# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉdef _refuse(actor: str, attempted: str, permitted: list, deal: str, phase: str) -> None:    raise gl.vm.UserError(        f"denied: {attempted} (caller {actor}) not in permitted {permitted}; "        f"deal={deal} phase={phase}"    )def _escrow_err(narrative: str) -> None:    raise gl.vm.UserError(f"escrow: {narrative}")def _arb_err(narrative: str) -> None:    raise gl.vm.UserError(f"arbitration: {narrative}")def _llm_err(narrative: str) -> None:    raise gl.vm.UserError(f"llm: {narrative}")def _fetch_err(narrative: str, transient: bool) -> None:    tag = "transient" if transient else "permanent"    raise gl.vm.UserError(f"fetch: {narrative} ({tag})")def _safe_str(x, max_len: int = 1024) -> str:    try:        s = str(x)    except Exception:        return ""    return s[:max_len]def _safe_int(x, default: int = 0) -> int:    try:        return int(float(str(x).strip()))    except Exception:        return defaultdef _clamp(n: int, lo: int, hi: int) -> int:    if n < lo:        return lo    if n > hi:        return hi    return ndef _hex_addr(a: Address) -> str:    try:        return a.as_hex    except Exception:        pass    try:        return "0x" + a.as_bytes.hex()    except Exception:        return "0x"# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 4. RECONCILIATION HELPERS# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉdef _agree_on_split(a: dict, b: dict, tol_bps: int = SPLIT_BPS_TOLERANCE) -> bool:    """The contract's signature equivalence predicate.    Two dispute verdicts agree iff they pick the same `verdict` label AND    their `split_bps` (share to seller) fall within `tol_bps`.    """    if not isinstance(a, dict) or not isinstance(b, dict):        return False    if str(a.get("verdict", "")).strip().upper() != \       str(b.get("verdict", "")).strip().upper():        return False    try:        sa = int(a.get("split_bps", 0))        sb = int(b.get("split_bps", 0))    except Exception:        return False    return abs(sa - sb) <= tol_bpsdef _agree_on_categorical(a: str, b: str) -> bool:    if a is None or b is None:        return False    return str(a).strip().lower() == str(b).strip().lower()# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 5. STORAGE DATACLASSES# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ@allow_storage@dataclassclass Deal:    deal_id: str    buyer: Address    seller: Address    witness: Address    witness_required: bool    milestones_uri: str    milestones_doc_sha256: str    total: u256    funded: u256    released: u256    phase: str    opened_at_seq: u64    allocated: u256    refunded: u256@allow_storage@dataclassclass Milestone:    deal_id: str    idx: u8    description: str    share_bps: u16    declared: bool    witnessed_ok: bool    requested_release: bool    released: bool    coherence_rationale: str    seller_award: u256    buyer_award: u256@allow_storage@dataclassclass RoleBinding:    deal_id: str    addr: Address    role: u8    bound_at_seq: u64    revoked_at_seq: u64@allow_storage@dataclassclass Attestation:    deal_id: str    milestone_idx: u8    witness: Address    ok: bool    notes: str    posted_at_seq: u64@allow_storage@dataclassclass Dispute:    dispute_id: str    deal_id: str    milestone_idx: u8    opener: Address    ground: str    ground_summary: str    evidence_uri: str    opened_at_seq: u64    finalized_at_seq: u64    final_verdict: str    final_split_bps: u32    bond: u256    bond_recipient: Address    bond_claimed: bool    opened_at_ts: u64    evidence_failed: bool    recovered: bool@allow_storage@dataclassclass ArbiterFinding:    deal_id: str    dispute_id: str    arbiter: Address    lean: str    notes: str    posted_at_seq: u64@gl.evm.contract_interfaceclass _Payee:    class View:        pass    class Write:        pass# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉ# 6. CONTRACT# ÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉclass EscrowArbiter(gl.Contract):    """Multi-party escrow with milestone tranches and arbitration."""    # ÔöÇÔöÇÔöÇ Storage ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    deals: TreeMap[str, Deal]    milestones: TreeMap[str, DynArray[Milestone]]    attestations: TreeMap[str, DynArray[Attestation]]    disputes: TreeMap[str, Dispute]    disputes_by_deal: TreeMap[str, DynArray[str]]    findings: TreeMap[str, ArbiterFinding]    findings_by_dispute: TreeMap[str, DynArray[str]]    roles: TreeMap[str, DynArray[RoleBinding]]    arbiter_pool: DynArray[Address]    platform: Address    next_seq: u64    deal_counter: u64    dispute_counter: u64    by_phase_counts: TreeMap[str, u32]    seller_claimable: TreeMap[str, u256]    buyer_claimable: TreeMap[str, u256]    def __init__(self):        self.platform = gl.message.sender_address        self.next_seq = u64(1)        self.deal_counter = u64(0)        self.dispute_counter = u64(0)        for p in PHASES_ALL:            self.by_phase_counts[p] = u32(0)    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.1 Role + Phase machinery    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    def _role_of(self, deal_id: str, addr: Address) -> int:        if deal_id not in self.roles:            return int(Role.NONE)        bindings = self.roles[deal_id]        for i in range(len(bindings)):            b = bindings[i]            if b.addr == addr and int(b.revoked_at_seq) == 0:                return int(b.role)        # Platform is implicit on any deal        if addr == self.platform:            return int(Role.PLATFORM)        return int(Role.NONE)    def _require_role(self, deal_id: str, allowed: tuple) -> int:        role = self._role_of(deal_id, gl.message.sender_address)        if role not in allowed:            permitted_names = [ROLE_NAMES.get(int(r), str(int(r))) for r in allowed]            phase = self._deal_phase(deal_id)            _refuse(                actor=_hex_addr(gl.message.sender_address),                attempted=ROLE_NAMES.get(role, str(role)),                permitted=permitted_names,                deal=deal_id,                phase=phase,            )        return role    def _bind_role(self, deal_id: str, addr: Address, role: Role) -> None:        if deal_id not in self.roles:            self.roles.get_or_insert_default(deal_id)        b = RoleBinding(            deal_id=deal_id,            addr=addr,            role=u8(int(role)),            bound_at_seq=self.next_seq,            revoked_at_seq=u64(0),        )        lst = self.roles[deal_id]        lst.append(b)        self.roles[deal_id] = lst    def _deal_phase(self, deal_id: str) -> str:        if deal_id not in self.deals:            return "UNKNOWN"        return self.deals[deal_id].phase    def _set_phase(self, deal_id: str, new_phase: str) -> None:        if deal_id not in self.deals:            _escrow_err(f"unknown deal {deal_id}")        d = self.deals[deal_id]        old = d.phase        d.phase = new_phase        self.deals[deal_id] = d        if old in self.by_phase_counts:            self.by_phase_counts[old] = u32(max(0, int(self.by_phase_counts[old]) - 1))        if new_phase in self.by_phase_counts:            self.by_phase_counts[new_phase] = u32(int(self.by_phase_counts[new_phase]) + 1)        else:            self.by_phase_counts[new_phase] = u32(1)    def _require_phase(self, deal_id: str, allowed_phases: tuple) -> str:        ph = self._deal_phase(deal_id)        if ph not in allowed_phases:            _escrow_err(f"phase {ph} not in {list(allowed_phases)}")        return ph    def _prepare_milestone_settlement(        self,        deal_id: str,        m: Milestone,        seller_award: int,        buyer_award: int,    ) -> int:        """Commit one tranche to pull-payment balances without transferring yet."""        if m.released:            _escrow_err(f"milestone {int(m.idx)} already settled")        d = self.deals[deal_id]        tranche = (int(d.total) * int(m.share_bps)) // 10000        if seller_award < 0 or buyer_award < 0:            _escrow_err("negative settlement award")        if seller_award + buyer_award != tranche:            _escrow_err(                f"settlement awards {seller_award + buyer_award} do not equal tranche {tranche}"            )        if int(d.allocated) + tranche > int(d.total):            _escrow_err("milestone shares exceed funded escrow")        self.seller_claimable[deal_id] = u256(            int(self.seller_claimable.get(deal_id, u256(0))) + seller_award        )        self.buyer_claimable[deal_id] = u256(            int(self.buyer_claimable.get(deal_id, u256(0))) + buyer_award        )        d.allocated = u256(int(d.allocated) + tranche)        self.deals[deal_id] = d        m.seller_award = u256(seller_award)        m.buyer_award = u256(buyer_award)        m.released = True        self._replace_milestone(deal_id, m)        return tranche    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.2 LLM call wrappers    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    def _llm_milestone_coherence(        self,        *,        deal_id: str,        milestone_description: str,        notes: str,    ) -> dict:        def call():            prompt = (                "A witness has attested a milestone is OK and added notes. "                "Decide whether the notes COHERE with the declared milestone "                "description: are they describing the same deliverable?\n\n"                f"Deal: {deal_id}\n"                f"Milestone description: {milestone_description[:1024]}\n"                f"Witness notes: {notes[:1024]}\n\n"                "Return strict JSON: "                '{"coherent": <bool>, "rationale": "<=240 chars"}'            )            return gl.nondet.exec_prompt(prompt, response_format="json")        def validator(leaders_res):            if not isinstance(leaders_res, gl.vm.Return):                return self._agree_on_error(leaders_res, call)            d = leaders_res.calldata            if not isinstance(d, dict):                return False            mine = call()            return bool(d.get("coherent", False)) == bool(mine.get("coherent", False))        raw = gl.vm.run_nondet_unsafe(call, validator)        if not isinstance(raw, dict):            _llm_err("model returned non-dict for milestone coherence")        return {            "coherent": bool(raw.get("coherent", True)),            "rationale": _safe_str(raw.get("rationale", ""), 240),        }    def _llm_dispute_summary(self, *, deal_id: str, ground: str) -> dict:        def call():            prompt = (                "Normalize a free-text dispute statement into a short summary "                "suitable for arbiter prompts. Keep the core grievance, drop "                "filler.\n\n"                f"Deal: {deal_id}\n"                f"Ground: {ground[:1024]}\n\n"                "Return strict JSON: "                '{"summary": "<=240 chars"}'            )            return gl.nondet.exec_prompt(prompt, response_format="json")        def validator(leaders_res):            if not isinstance(leaders_res, gl.vm.Return):                return self._agree_on_error(leaders_res, call)            d = leaders_res.calldata            if not isinstance(d, dict):                return False            mine = call()            # summaries don't have to match word-for-word; only categorical            # agreement on "summary truthiness" (both non-empty)            return bool(str(d.get("summary", "")).strip()) == bool(str(mine.get("summary", "")).strip())        raw = gl.vm.run_nondet_unsafe(call, validator)        if not isinstance(raw, dict):            _llm_err("model returned non-dict for dispute summary")        return {"summary": _safe_str(raw.get("summary", ""), 240)}    def _llm_jury_verdict(        self,        *,        deal_id: str,        ground_summary: str,        findings: list,        evidence_text: str,    ) -> dict:        findings_text = json.dumps(findings, sort_keys=True)[:2048]        ev_text = evidence_text[:2048]        def call():            prompt = (                "You synthesize a final verdict for an escrow dispute given "                "arbiter findings and fetched evidence text. Pick BUYER_WINS, "                "SELLER_WINS, or SPLIT. If SPLIT, choose split_bps = share of "                "the disputed tranche to release to the seller (0..10000).\n\n"                f"Deal: {deal_id}\n"                f"Ground (summary): {ground_summary}\n"                f"Arbiter findings: {findings_text}\n"                f"Evidence excerpt: {ev_text}\n\n"                "Return strict JSON: "                '{"verdict": "BUYER_WINS|SELLER_WINS|SPLIT", '                '"split_bps": <int 0-10000>, '                '"reasoning": "<=480 chars"}'            )            return gl.nondet.exec_prompt(prompt, response_format="json")        def validator(leaders_res):            if not isinstance(leaders_res, gl.vm.Return):                return self._agree_on_error(leaders_res, call)            d = leaders_res.calldata            if not isinstance(d, dict):                return False            mine = call()            return _agree_on_split(d, mine)        raw = gl.vm.run_nondet_unsafe(call, validator)        if not isinstance(raw, dict):            _llm_err("model returned non-dict for jury verdict")        verdict = str(raw.get("verdict", "")).strip().upper()        if verdict not in VERDICT_VALUES:            _llm_err(f"bad verdict label: {verdict}")        split = _clamp(_safe_int(raw.get("split_bps", 0)), 0, 10000)        if verdict == VERDICT_BUYER_WINS:            split = 0        elif verdict == VERDICT_SELLER_WINS:            split = 10000        return {            "verdict": verdict,            "split_bps": split,            "reasoning": _safe_str(raw.get("reasoning", ""), 480),        }    def _agree_on_error(self, leaders_res, call_fn) -> bool:        leader_msg = getattr(leaders_res, "message", "") or str(leaders_res)        try:            call_fn()            return False        except gl.vm.UserError as e:            local_msg = getattr(e, "message", "") or str(e)            # Narrative-prefix agreement: match the part before the first ':'            l_prefix = leader_msg.split(":")[0]            local_prefix = local_msg.split(":")[0]            return l_prefix == local_prefix    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.3 Web fetches    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    def _fetch_milestones_doc(self, milestones_uri: str) -> dict:        def call():            try:                response = gl.nondet.web.get(                    milestones_uri, headers={"Accept": "application/json"},                )            except Exception as e:                _fetch_err(f"milestones_uri fail: {str(e)[:120]}", transient=True)            status = getattr(response, "status", 0)            if status >= 500:                _fetch_err(f"milestones_uri 5xx: {int(status)}", transient=True)            if status >= 400:                _fetch_err(f"milestones_uri 4xx: {int(status)}", transient=False)            body = getattr(response, "body", b"")            if isinstance(body, (bytes, bytearray)):                sha = hashlib.sha256(bytes(body)).hexdigest()            else:                sha = hashlib.sha256(str(body).encode("utf-8", errors="ignore")).hexdigest()            return {"sha256": sha, "status": int(status)}        def validator(leaders_res):            if not isinstance(leaders_res, gl.vm.Return):                return self._agree_on_error(leaders_res, call)            d = leaders_res.calldata            if not isinstance(d, dict):                return False            mine = call()            return str(d.get("sha256", "")) == str(mine.get("sha256", ""))        return gl.vm.run_nondet_unsafe(call, validator)    def _fetch_evidence_bundle(self, evidence_uri: str) -> dict:        def call():            try:                response = gl.nondet.web.get(                    evidence_uri, headers={"Accept": "*/*"},                )            except Exception as e:                _fetch_err(f"evidence fetch fail: {str(e)[:120]}", transient=True)            status = getattr(response, "status", 0)            if status >= 500:                _fetch_err(f"evidence 5xx: {int(status)}", transient=True)            if status >= 400:                _fetch_err(f"evidence 4xx: {int(status)}", transient=False)            body = getattr(response, "body", b"")            if isinstance(body, (bytes, bytearray)):                text = body.decode("utf-8", errors="ignore")[:4096]                sha = hashlib.sha256(bytes(body)).hexdigest()            else:                text = str(body)[:4096]                sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()            return {"text": text, "sha256": sha, "status": int(status)}        def validator(leaders_res):            if not isinstance(leaders_res, gl.vm.Return):                return self._agree_on_error(leaders_res, call)            d = leaders_res.calldata            if not isinstance(d, dict):                return False            mine = call()            return str(d.get("sha256", "")) == str(mine.get("sha256", ""))        return gl.vm.run_nondet_unsafe(call, validator)    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.4 PUBLIC WRITES    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    @gl.public.write.payable    def open_deal(        self,        seller: Address,        milestones_uri: str,        total: u256,        witness_required: bool,    ) -> str:        funded = int(gl.message.value)        if funded != int(total):            _escrow_err(f"funded {funded} must equal total {int(total)}")        if not _safe_str(milestones_uri, 1024):            _escrow_err("milestones_uri empty")        meta = self._fetch_milestones_doc(milestones_uri)        self.deal_counter = u64(int(self.deal_counter) + 1)        deal_id = hashlib.sha256(            f"deal|{int(self.deal_counter)}|{_hex_addr(gl.message.sender_address)}".encode("utf-8")        ).hexdigest()        d = Deal(            deal_id=deal_id,            buyer=gl.message.sender_address,            seller=seller,            witness=Address(b"\x00" * 20),            witness_required=bool(witness_required),            milestones_uri=_safe_str(milestones_uri, 1024),            milestones_doc_sha256=str(meta.get("sha256", "")),            total=u256(int(total)),            funded=u256(funded),            released=u256(0),            phase=PHASE_FUNDED,            opened_at_seq=self.next_seq,            allocated=u256(0),            refunded=u256(0),        )        self.deals[deal_id] = d        self.milestones.get_or_insert_default(deal_id)        self.attestations.get_or_insert_default(deal_id)        self.disputes_by_deal.get_or_insert_default(deal_id)        self.roles.get_or_insert_default(deal_id)        self._bind_role(deal_id, gl.message.sender_address, Role.BUYER)        self.by_phase_counts[PHASE_FUNDED] = u32(int(self.by_phase_counts.get(PHASE_FUNDED, u32(0))) + 1)        self.next_seq = u64(int(self.next_seq) + 1)        return deal_id    @gl.public.write    def accept_deal(self, deal_id: str) -> None:        if deal_id not in self.deals:            _escrow_err(f"unknown deal {deal_id}")        d = self.deals[deal_id]        if gl.message.sender_address != d.seller:            _refuse(                actor=_hex_addr(gl.message.sender_address),                attempted="ACCEPTOR",                permitted=["seller"],                deal=deal_id,                phase=d.phase,            )        if d.phase != PHASE_FUNDED:            _escrow_err(f"deal not in FUNDED phase: {d.phase}")        self._bind_role(deal_id, gl.message.sender_address, Role.SELLER)        self._set_phase(deal_id, PHASE_IN_PROGRESS)    @gl.public.write    def add_witness(self, deal_id: str, witness: Address) -> None:        role = self._require_role(deal_id, (Role.BUYER, Role.SELLER))        d = self.deals[deal_id]        if int(role) == int(Role.BUYER):            d.witness = witness            self.deals[deal_id] = d        # Bind the witness role once the witness address is registered on the        # deal (buyer sets it above; seller's call is idempotent).        if d.witness == witness:            self._bind_role(deal_id, witness, Role.WITNESS)    @gl.public.write    def declare_milestone(        self,        deal_id: str,        idx: u8,        description: str,        share_bps: u16,    ) -> None:        self._require_role(deal_id, (Role.SELLER,))        self._require_phase(deal_id, (PHASE_IN_PROGRESS,))        if int(share_bps) <= 0 or int(share_bps) > 10000:            _escrow_err(f"share_bps out of range: {int(share_bps)}")        lst = self.milestones[deal_id]        # Check idx not yet declared        for i in range(len(lst)):            if int(lst[i].idx) == int(idx):                _escrow_err(f"milestone idx {int(idx)} already declared")        m = Milestone(            deal_id=deal_id,            idx=u8(int(idx)),            description=_safe_str(description, 1024),            share_bps=u16(int(share_bps)),            declared=True,            witnessed_ok=False,            requested_release=False,            released=False,            coherence_rationale="",            seller_award=u256(0),            buyer_award=u256(0),        )        lst.append(m)        self.milestones[deal_id] = lst    @gl.public.write    def attest_milestone(self, deal_id: str, idx: u8, ok: bool, notes: str) -> None:        self._require_role(deal_id, (Role.WITNESS,))        self._require_phase(deal_id, (PHASE_IN_PROGRESS, PHASE_MILESTONE_REVIEW))        m = self._find_milestone(deal_id, int(idx))        if not m.declared:            _escrow_err(f"milestone {int(idx)} not declared")        if ok:            coh = self._llm_milestone_coherence(                deal_id=deal_id,                milestone_description=m.description,                notes=notes,            )            if not coh.get("coherent", False):                _llm_err(f"notes incoherent for milestone {int(idx)}: {coh.get('rationale', '')[:160]}")            m.witnessed_ok = True            m.coherence_rationale = coh.get("rationale", "")        else:            m.witnessed_ok = False        self._replace_milestone(deal_id, m)        att = Attestation(            deal_id=deal_id,            milestone_idx=u8(int(idx)),            witness=gl.message.sender_address,            ok=bool(ok),            notes=_safe_str(notes, 1024),            posted_at_seq=self.next_seq,        )        alst = self.attestations[deal_id]        alst.append(att)        self.attestations[deal_id] = alst        self.next_seq = u64(int(self.next_seq) + 1)    @gl.public.write    def request_release(self, deal_id: str, idx: u8) -> None:        self._require_role(deal_id, (Role.SELLER,))        self._require_phase(deal_id, (PHASE_IN_PROGRESS,))        m = self._find_milestone(deal_id, int(idx))        d = self.deals[deal_id]        if d.witness_required and not m.witnessed_ok:            _escrow_err(f"milestone {int(idx)} not witnessed yet")        m.requested_release = True        self._replace_milestone(deal_id, m)        self._set_phase(deal_id, PHASE_MILESTONE_REVIEW)    @gl.public.write    def release_milestone(self, deal_id: str, idx: u8) -> int:        self._require_role(deal_id, (Role.BUYER,))        self._require_phase(deal_id, (PHASE_MILESTONE_REVIEW,))        m = self._find_milestone(deal_id, int(idx))        if m.released:            _escrow_err(f"milestone {int(idx)} already released")        if not m.requested_release:            _escrow_err(f"milestone {int(idx)} release not requested")        d = self.deals[deal_id]        tranche = (int(d.total) * int(m.share_bps)) // 10000        self._prepare_milestone_settlement(            deal_id=deal_id,            m=m,            seller_award=tranche,            buyer_award=0,        )        # back to in-progress (or to closed if all milestones released)        if self._all_released(deal_id):            self._set_phase(deal_id, PHASE_CLOSED)        else:            self._set_phase(deal_id, PHASE_IN_PROGRESS)        return tranche    @gl.public.write.payable    def open_dispute(self, deal_id: str, idx: u8, ground: str, evidence_uri: str) -> str:        self._require_role(deal_id, (Role.BUYER, Role.SELLER))        self._require_phase(deal_id, (PHASE_IN_PROGRESS, PHASE_MILESTONE_REVIEW))        bond = int(gl.message.value)        if bond < 1:            _escrow_err("dispute bond required")        if not _safe_str(ground, 2048):            _escrow_err("ground empty")        milestone = self._find_milestone(deal_id, int(idx))        if milestone.released:            _escrow_err(f"milestone {int(idx)} already settled")        summary = self._llm_dispute_summary(deal_id=deal_id, ground=ground)        self.dispute_counter = u64(int(self.dispute_counter) + 1)        dispute_id = hashlib.sha256(            f"dispute|{deal_id}|{int(idx)}|{int(self.dispute_counter)}".encode("utf-8")        ).hexdigest()        dp = Dispute(            dispute_id=dispute_id,            deal_id=deal_id,            milestone_idx=u8(int(idx)),            opener=gl.message.sender_address,            ground=_safe_str(ground, 2048),            ground_summary=_safe_str(summary.get("summary", ""), 240),            evidence_uri=_safe_str(evidence_uri, 1024),            opened_at_seq=self.next_seq,            finalized_at_seq=u64(0),            final_verdict="",            final_split_bps=u32(0),            bond=u256(bond),            bond_recipient=Address(b"\x00" * 20),            bond_claimed=False,            opened_at_ts=u64(int(datetime.now(timezone.utc).timestamp())),            evidence_failed=False,            recovered=False,        )        self.disputes[dispute_id] = dp        lst = self.disputes_by_deal[deal_id]        lst.append(dispute_id)        self.disputes_by_deal[deal_id] = lst        self.findings_by_dispute.get_or_insert_default(dispute_id)        self._set_phase(deal_id, PHASE_DISPUTED)        self.next_seq = u64(int(self.next_seq) + 1)        return dispute_id    @gl.public.write    def assign_arbiter(self, deal_id: str, addr: Address) -> None:        self._require_role(deal_id, (Role.PLATFORM,))        self._require_phase(deal_id, (PHASE_DISPUTED, PHASE_ARBITRATING))        self._bind_role(deal_id, addr, Role.ARBITER)        if self._deal_phase(deal_id) == PHASE_DISPUTED:            self._set_phase(deal_id, PHASE_ARBITRATING)    @gl.public.write    def file_arbiter_finding(self, deal_id: str, dispute_id: str, lean: str, notes: str) -> str:        self._require_role(deal_id, (Role.ARBITER,))        self._require_phase(deal_id, (PHASE_ARBITRATING,))        if dispute_id not in self.disputes:            _arb_err(f"unknown dispute {dispute_id}")        finding_id = hashlib.sha256(            f"finding|{dispute_id}|{_hex_addr(gl.message.sender_address)}|{int(self.next_seq)}".encode("utf-8")        ).hexdigest()        f = ArbiterFinding(            deal_id=deal_id,            dispute_id=dispute_id,            arbiter=gl.message.sender_address,            lean=_safe_str(lean, 96),            notes=_safe_str(notes, 1024),            posted_at_seq=self.next_seq,        )        self.findings[finding_id] = f        lst = self.findings_by_dispute[dispute_id]        lst.append(finding_id)        self.findings_by_dispute[dispute_id] = lst        self.next_seq = u64(int(self.next_seq) + 1)        return finding_id    @gl.public.write    def finalize_dispute(self, deal_id: str, dispute_id: str) -> str:        self._require_phase(deal_id, (PHASE_ARBITRATING,))        if dispute_id not in self.disputes:            _arb_err(f"unknown dispute {dispute_id}")        dp = self.disputes[dispute_id]        if int(dp.finalized_at_seq) > 0:            _arb_err("already finalized")        finding_ids = self.findings_by_dispute[dispute_id]        if len(finding_ids) < QUORUM_ARBITERS:            _arb_err(f"quorum {QUORUM_ARBITERS} not met, have {len(finding_ids)}")        findings_list = []        for i in range(len(finding_ids)):            fid = finding_ids[i]            if fid in self.findings:                f = self.findings[fid]                findings_list.append({                    "arbiter": _hex_addr(f.arbiter),                    "lean": f.lean,                    "notes": f.notes[:480],                })        evidence_text = ""        evidence_failed = False        if dp.evidence_uri:            try:                ev = self._fetch_evidence_bundle(dp.evidence_uri)                evidence_text = str(ev.get("text", ""))            except gl.vm.UserError:                # evidence fetch failure does not stop arbitration; we proceed                # with empty evidence_text.                evidence_text = ""                evidence_failed = True        result = self._llm_jury_verdict(            deal_id=deal_id,            ground_summary=dp.ground_summary,            findings=findings_list,            evidence_text=evidence_text,        )        dp.final_verdict = result["verdict"]        dp.final_split_bps = u32(int(result["split_bps"]))        dp.finalized_at_seq = self.next_seq        dp.evidence_failed = evidence_failed        # Commit the verdict to pull-payment balances. GEN leaves the contract        # only when the authorized party claims it.        m = self._find_milestone(deal_id, int(dp.milestone_idx))        d = self.deals[deal_id]        tranche = (int(d.total) * int(m.share_bps)) // 10000        seller_share = (tranche * int(dp.final_split_bps)) // 10000        buyer_share = tranche - seller_share        self._prepare_milestone_settlement(            deal_id=deal_id,            m=m,            seller_award=seller_share,            buyer_award=buyer_share,        )        if result["verdict"] == VERDICT_SELLER_WINS:            dp.bond_recipient = d.seller        elif result["verdict"] == VERDICT_BUYER_WINS:            dp.bond_recipient = d.buyer        else:            dp.bond_recipient = dp.opener        self.disputes[dispute_id] = dp        if self._all_released(deal_id):            self._set_phase(deal_id, PHASE_CLOSED)        else:            self._set_phase(deal_id, PHASE_IN_PROGRESS)        self.next_seq = u64(int(self.next_seq) + 1)        return result["verdict"]    @gl.public.write    def recover_timed_out_dispute(self, deal_id: str, dispute_id: str) -> int:        """Refund a stalled disputed tranche after the deterministic deadline."""        self._require_role(deal_id, (Role.BUYER, Role.SELLER))        self._require_phase(deal_id, (PHASE_DISPUTED, PHASE_ARBITRATING))        if dispute_id not in self.disputes:            _arb_err(f"unknown dispute {dispute_id}")        dp = self.disputes[dispute_id]        if dp.deal_id != deal_id:            _arb_err("dispute does not belong to deal")        if int(dp.finalized_at_seq) > 0 or dp.recovered:            _arb_err("dispute already resolved")        now_ts = int(datetime.now(timezone.utc).timestamp())        unlock_ts = int(dp.opened_at_ts) + DISPUTE_RECOVERY_TIMEOUT_SECONDS        if now_ts < unlock_ts:            _arb_err(f"recovery not available before {unlock_ts}")        m = self._find_milestone(deal_id, int(dp.milestone_idx))        d = self.deals[deal_id]        tranche = (int(d.total) * int(m.share_bps)) // 10000        self._prepare_milestone_settlement(            deal_id=deal_id,            m=m,            seller_award=0,            buyer_award=tranche,        )        dp.final_verdict = VERDICT_RECOVERY_REFUND        dp.final_split_bps = u32(0)        dp.finalized_at_seq = self.next_seq        dp.bond_recipient = dp.opener        dp.recovered = True        self.disputes[dispute_id] = dp        if self._all_released(deal_id):            self._set_phase(deal_id, PHASE_CLOSED)        else:            self._set_phase(deal_id, PHASE_IN_PROGRESS)        self.next_seq = u64(int(self.next_seq) + 1)        return tranche    @gl.public.write    def claim_seller_payout(self, deal_id: str) -> int:        self._require_role(deal_id, (Role.SELLER,))        amount = int(self.seller_claimable.get(deal_id, u256(0)))        if amount <= 0:            _escrow_err("no seller payout claimable")        d = self.deals[deal_id]        if int(d.released) + int(d.refunded) + amount > int(d.funded):            _escrow_err("seller payout exceeds funded escrow")        # Checks-effects-interactions: zero claimable before emitting value.        self.seller_claimable[deal_id] = u256(0)        d.released = u256(int(d.released) + amount)        self.deals[deal_id] = d        _Payee(d.seller).emit_transfer(value=u256(amount))        return amount    @gl.public.write    def claim_buyer_refund(self, deal_id: str) -> int:        self._require_role(deal_id, (Role.BUYER,))        amount = int(self.buyer_claimable.get(deal_id, u256(0)))        if amount <= 0:            _escrow_err("no buyer refund claimable")        d = self.deals[deal_id]        if int(d.released) + int(d.refunded) + amount > int(d.funded):            _escrow_err("buyer refund exceeds funded escrow")        self.buyer_claimable[deal_id] = u256(0)        d.refunded = u256(int(d.refunded) + amount)        self.deals[deal_id] = d        _Payee(d.buyer).emit_transfer(value=u256(amount))        return amount    @gl.public.write    def claim_dispute_bond(self, dispute_id: str) -> int:        if dispute_id not in self.disputes:            _arb_err(f"unknown dispute {dispute_id}")        dp = self.disputes[dispute_id]        if int(dp.finalized_at_seq) == 0:            _arb_err("dispute not resolved")        if dp.bond_claimed:            _arb_err("bond already claimed")        if gl.message.sender_address != dp.bond_recipient:            _arb_err("only bond recipient may claim")        amount = int(dp.bond)        if amount <= 0:            _arb_err("no dispute bond claimable")        recipient = dp.bond_recipient        dp.bond = u256(0)        dp.bond_claimed = True        self.disputes[dispute_id] = dp        _Payee(recipient).emit_transfer(value=u256(amount))        return amount    @gl.public.write    def void_deal(self, deal_id: str, reason: str) -> int:        self._require_role(deal_id, (Role.PLATFORM,))        d = self.deals[deal_id]        if d.phase == PHASE_CLOSED or d.phase == PHASE_VOID:            _escrow_err(f"deal already terminal: {d.phase}")        remaining = int(d.funded) - int(d.allocated)        if remaining < 0:            _escrow_err("allocated escrow exceeds funding")        self.buyer_claimable[deal_id] = u256(            int(self.buyer_claimable.get(deal_id, u256(0))) + remaining        )        d.allocated = d.funded        self.deals[deal_id] = d        self._set_phase(deal_id, PHASE_VOID)        return remaining    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.5 Internal milestone helpers    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    def _find_milestone(self, deal_id: str, idx: int) -> Milestone:        if deal_id not in self.milestones:            _escrow_err(f"deal has no milestones array: {deal_id}")        lst = self.milestones[deal_id]        for i in range(len(lst)):            if int(lst[i].idx) == idx:                return lst[i]        _escrow_err(f"milestone idx {idx} not found")    def _replace_milestone(self, deal_id: str, m: Milestone) -> None:        lst = self.milestones[deal_id]        for i in range(len(lst)):            if int(lst[i].idx) == int(m.idx):                lst[i] = m                self.milestones[deal_id] = lst                return        _escrow_err(f"milestone idx {int(m.idx)} not found in replace")    def _all_released(self, deal_id: str) -> bool:        lst = self.milestones[deal_id]        if len(lst) == 0:            return False        for i in range(len(lst)):            if not lst[i].released:                return False        return True    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    # 6.6 PUBLIC VIEWS    # ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ    @gl.public.view    def deal(self, deal_id: str) -> dict:        if deal_id not in self.deals:            return {"deal_id": deal_id, "exists": False}        d = self.deals[deal_id]        return {            "deal_id": d.deal_id,            "exists": True,            "buyer": _hex_addr(d.buyer),            "seller": _hex_addr(d.seller),            "witness": _hex_addr(d.witness),            "witness_required": bool(d.witness_required),            "milestones_uri": d.milestones_uri,            "milestones_doc_sha256": d.milestones_doc_sha256,            "total": int(d.total),            "funded": int(d.funded),            "allocated": int(d.allocated),            "released": int(d.released),            "refunded": int(d.refunded),            "escrow_balance": int(d.funded) - int(d.released) - int(d.refunded),            "seller_claimable": int(self.seller_claimable.get(deal_id, u256(0))),            "buyer_claimable": int(self.buyer_claimable.get(deal_id, u256(0))),            "phase": d.phase,            "opened_at_seq": int(d.opened_at_seq),        }    @gl.public.view    def milestones_of(self, deal_id: str) -> list:        if deal_id not in self.milestones:            return []        lst = self.milestones[deal_id]        out = []        for i in range(len(lst)):            m = lst[i]            out.append({                "idx": int(m.idx),                "description": m.description,                "share_bps": int(m.share_bps),                "declared": bool(m.declared),                "witnessed_ok": bool(m.witnessed_ok),                "requested_release": bool(m.requested_release),                "released": bool(m.released),                "coherence_rationale": m.coherence_rationale,                "seller_award": int(m.seller_award),                "buyer_award": int(m.buyer_award),            })        return out    @gl.public.view    def role_of(self, deal_id: str, addr: Address) -> str:        return ROLE_NAMES.get(self._role_of(deal_id, addr), "NONE")    @gl.public.view    def participants(self, deal_id: str) -> dict:        if deal_id not in self.deals:            return {}        d = self.deals[deal_id]        return {            "buyer": _hex_addr(d.buyer),            "seller": _hex_addr(d.seller),            "witness": _hex_addr(d.witness),            "platform": _hex_addr(self.platform),        }    @gl.public.view    def dispute(self, dispute_id: str) -> dict:        if dispute_id not in self.disputes:            return {"dispute_id": dispute_id, "exists": False}        dp = self.disputes[dispute_id]        return {            "dispute_id": dp.dispute_id,            "exists": True,            "deal_id": dp.deal_id,            "milestone_idx": int(dp.milestone_idx),            "opener": _hex_addr(dp.opener),            "ground": dp.ground,            "ground_summary": dp.ground_summary,            "evidence_uri": dp.evidence_uri,            "opened_at_seq": int(dp.opened_at_seq),            "finalized_at_seq": int(dp.finalized_at_seq),            "final_verdict": dp.final_verdict,            "final_split_bps": int(dp.final_split_bps),            "bond": int(dp.bond),            "bond_recipient": _hex_addr(dp.bond_recipient),            "bond_claimed": bool(dp.bond_claimed),            "opened_at_ts": int(dp.opened_at_ts),            "evidence_failed": bool(dp.evidence_failed),            "recovered": bool(dp.recovered),        }    @gl.public.view    def tranche_state(self, deal_id: str, idx: u32) -> dict:        try:            m = self._find_milestone(deal_id, int(idx))        except gl.vm.UserError:            return {"deal_id": deal_id, "idx": int(idx), "exists": False}        d = self.deals[deal_id]        tranche = (int(d.total) * int(m.share_bps)) // 10000        return {            "deal_id": deal_id,            "idx": int(m.idx),            "exists": True,            "share_bps": int(m.share_bps),            "tranche_value": tranche,            "released": bool(m.released),            "requested_release": bool(m.requested_release),            "witnessed_ok": bool(m.witnessed_ok),            "seller_award": int(m.seller_award),            "buyer_award": int(m.buyer_award),            "seller_claimable": int(self.seller_claimable.get(deal_id, u256(0))),            "buyer_claimable": int(self.buyer_claimable.get(deal_id, u256(0))),        }    @gl.public.view    def platform_summary(self) -> dict:        counts = {}        for p in PHASES_ALL:            counts[p] = int(self.by_phase_counts.get(p, u32(0)))        return {            "platform": _hex_addr(self.platform),            "deals_total": int(self.deal_counter),            "disputes_total": int(self.dispute_counter),            "phase_counts": counts,        }
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+"""Multi-party escrow with milestone tranches and on-call arbitration.
+
+This is the `escrow-judge` contract from the 04-onyx hub. It is a
+WORKFLOW contract — its sole responsibility is to coordinate the
+incremental release of escrowed value across a sequence of milestones,
+each gated by per-role approvals and arbitrated when disputed.
+
+Operation type: WORKFLOW
+========================
+Every deal moves through a sequence of milestones. Each milestone has
+a declared share of the total escrow value. A milestone releases its
+tranche only when its prerequisites have been ticked off by the right
+roles (Buyer signs off; optional Witness attestation; Seller's release
+request). Disputes pause the milestone and route to a small arbiter
+jury whose findings are synthesized by an LLM into a final verdict.
+
+Architectural style: multi-actor role registry
+==============================================
+Every deal has its own role binding map. The same address can be a
+Buyer in one deal and an Arbiter in another. Every privileged method
+calls `_require_role(deal_id, allowed_tuple)` as its first statement.
+Phase is checked second.
+
+Non-determinism budget
+======================
+  * 3 distinct LLM call sites:
+      - `_llm_milestone_coherence` inside `attest_milestone`
+      - `_llm_dispute_summary`     inside `open_dispute`
+      - `_llm_jury_verdict`        inside `finalize_dispute`
+  * 2 distinct web-fetch lambdas:
+      - `_fetch_milestones_doc`    inside `open_deal`
+      - `_fetch_evidence_bundle`   inside `finalize_dispute`
+  * Custom reconciliation helper `_agree_on_split`.
+
+Public surface
+==============
+Writes (16): open_deal, accept_deal, add_witness, declare_milestone,
+             attest_milestone, request_release, release_milestone,
+             open_dispute, assign_arbiter, file_arbiter_finding,
+             finalize_dispute, recover_timed_out_dispute,
+             claim_seller_payout, claim_buyer_refund,
+             claim_dispute_bond, void_deal.
+Views   (7): deal, milestones, role_of, participants, dispute,
+             tranche_state, platform_summary.
+
+Error envelope
+==============
+English-narrative refusals:
+  denied: ROLE cannot ACTION in PHASE
+  escrow: NARRATIVE
+  arbitration: NARRATIVE
+  llm: NARRATIVE
+  fetch: NARRATIVE (transient|permanent)
+"""
+
+import hashlib
+import json
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import IntEnum
+
+from genlayer import *
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1. CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════
+
+PHASE_AWAITING_FUND   = "AWAITING_FUND"
+PHASE_FUNDED          = "FUNDED"
+PHASE_IN_PROGRESS     = "IN_PROGRESS"
+PHASE_MILESTONE_REVIEW = "MILESTONE_REVIEW"
+PHASE_DISPUTED        = "DISPUTED"
+PHASE_ARBITRATING     = "ARBITRATING"
+PHASE_SETTLING        = "SETTLING"
+PHASE_CLOSED          = "CLOSED"
+PHASE_VOID            = "VOID"
+
+PHASES_ALL = (
+    PHASE_AWAITING_FUND, PHASE_FUNDED, PHASE_IN_PROGRESS,
+    PHASE_MILESTONE_REVIEW, PHASE_DISPUTED, PHASE_ARBITRATING,
+    PHASE_SETTLING, PHASE_CLOSED, PHASE_VOID,
+)
+
+VERDICT_BUYER_WINS = "BUYER_WINS"
+VERDICT_SELLER_WINS = "SELLER_WINS"
+VERDICT_SPLIT = "SPLIT"
+VERDICT_RECOVERY_REFUND = "RECOVERY_REFUND"
+VERDICT_VALUES = (VERDICT_BUYER_WINS, VERDICT_SELLER_WINS, VERDICT_SPLIT)
+
+QUORUM_ARBITERS = 1   # minimum arbiter findings before LLM can finalize
+SPLIT_BPS_TOLERANCE = 500  # validator agreement band on split bps
+DISPUTE_RECOVERY_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2. ROLES
+# ═══════════════════════════════════════════════════════════════════════
+
+class Role(IntEnum):
+    NONE     = 0
+    BUYER    = 1
+    SELLER   = 2
+    WITNESS  = 3
+    ARBITER  = 4
+    PLATFORM = 5
+
+
+ROLE_NAMES = {
+    int(Role.NONE):     "NONE",
+    int(Role.BUYER):    "BUYER",
+    int(Role.SELLER):   "SELLER",
+    int(Role.WITNESS):  "WITNESS",
+    int(Role.ARBITER):  "ARBITER",
+    int(Role.PLATFORM): "PLATFORM",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 3. ERROR HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def _refuse(actor: str, attempted: str, permitted: list, deal: str, phase: str) -> None:
+    raise gl.vm.UserError(
+        f"denied: {attempted} (caller {actor}) not in permitted {permitted}; "
+        f"deal={deal} phase={phase}"
+    )
+
+
+def _escrow_err(narrative: str) -> None:
+    raise gl.vm.UserError(f"escrow: {narrative}")
+
+
+def _arb_err(narrative: str) -> None:
+    raise gl.vm.UserError(f"arbitration: {narrative}")
+
+
+def _llm_err(narrative: str) -> None:
+    raise gl.vm.UserError(f"llm: {narrative}")
+
+
+def _fetch_err(narrative: str, transient: bool) -> None:
+    tag = "transient" if transient else "permanent"
+    raise gl.vm.UserError(f"fetch: {narrative} ({tag})")
+
+
+def _safe_str(x, max_len: int = 1024) -> str:
+    try:
+        s = str(x)
+    except Exception:
+        return ""
+    return s[:max_len]
+
+
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        return int(float(str(x).strip()))
+    except Exception:
+        return default
+
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
+
+
+def _hex_addr(a: Address) -> str:
+    try:
+        return a.as_hex
+    except Exception:
+        pass
+    try:
+        return "0x" + a.as_bytes.hex()
+    except Exception:
+        return "0x"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. RECONCILIATION HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+
+def _agree_on_split(a: dict, b: dict, tol_bps: int = SPLIT_BPS_TOLERANCE) -> bool:
+    """The contract's signature equivalence predicate.
+
+    Two dispute verdicts agree iff they pick the same `verdict` label AND
+    their `split_bps` (share to seller) fall within `tol_bps`.
+    """
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    if str(a.get("verdict", "")).strip().upper() != \
+       str(b.get("verdict", "")).strip().upper():
+        return False
+    try:
+        sa = int(a.get("split_bps", 0))
+        sb = int(b.get("split_bps", 0))
+    except Exception:
+        return False
+    return abs(sa - sb) <= tol_bps
+
+
+def _agree_on_categorical(a: str, b: str) -> bool:
+    if a is None or b is None:
+        return False
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. STORAGE DATACLASSES
+# ═══════════════════════════════════════════════════════════════════════
+
+@allow_storage
+@dataclass
+class Deal:
+    deal_id: str
+    buyer: Address
+    seller: Address
+    witness: Address
+    witness_required: bool
+    milestones_uri: str
+    milestones_doc_sha256: str
+    total: u256
+    funded: u256
+    released: u256
+    phase: str
+    opened_at_seq: u64
+    allocated: u256
+    refunded: u256
+
+
+@allow_storage
+@dataclass
+class Milestone:
+    deal_id: str
+    idx: u8
+    description: str
+    share_bps: u16
+    declared: bool
+    witnessed_ok: bool
+    requested_release: bool
+    released: bool
+    coherence_rationale: str
+    seller_award: u256
+    buyer_award: u256
+
+
+@allow_storage
+@dataclass
+class RoleBinding:
+    deal_id: str
+    addr: Address
+    role: u8
+    bound_at_seq: u64
+    revoked_at_seq: u64
+
+
+@allow_storage
+@dataclass
+class Attestation:
+    deal_id: str
+    milestone_idx: u8
+    witness: Address
+    ok: bool
+    notes: str
+    posted_at_seq: u64
+
+
+@allow_storage
+@dataclass
+class Dispute:
+    dispute_id: str
+    deal_id: str
+    milestone_idx: u8
+    opener: Address
+    ground: str
+    ground_summary: str
+    evidence_uri: str
+    opened_at_seq: u64
+    finalized_at_seq: u64
+    final_verdict: str
+    final_split_bps: u32
+    bond: u256
+    bond_recipient: Address
+    bond_claimed: bool
+    opened_at_ts: u64
+    evidence_failed: bool
+    recovered: bool
+
+
+@allow_storage
+@dataclass
+class ArbiterFinding:
+    deal_id: str
+    dispute_id: str
+    arbiter: Address
+    lean: str
+    notes: str
+    posted_at_seq: u64
+
+
+@gl.evm.contract_interface
+class _Payee:
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. CONTRACT
+# ═══════════════════════════════════════════════════════════════════════
+
+class EscrowArbiter(gl.Contract):
+    """Multi-party escrow with milestone tranches and arbitration."""
+
+    # ─── Storage ───────────────────────────────────────────────────────
+    deals: TreeMap[str, Deal]
+    milestones: TreeMap[str, DynArray[Milestone]]
+    attestations: TreeMap[str, DynArray[Attestation]]
+    disputes: TreeMap[str, Dispute]
+    disputes_by_deal: TreeMap[str, DynArray[str]]
+    findings: TreeMap[str, ArbiterFinding]
+    findings_by_dispute: TreeMap[str, DynArray[str]]
+    roles: TreeMap[str, DynArray[RoleBinding]]
+    arbiter_pool: DynArray[Address]
+    platform: Address
+    next_seq: u64
+    deal_counter: u64
+    dispute_counter: u64
+    by_phase_counts: TreeMap[str, u32]
+    seller_claimable: TreeMap[str, u256]
+    buyer_claimable: TreeMap[str, u256]
+
+    def __init__(self):
+        self.platform = gl.message.sender_address
+        self.next_seq = u64(1)
+        self.deal_counter = u64(0)
+        self.dispute_counter = u64(0)
+        for p in PHASES_ALL:
+            self.by_phase_counts[p] = u32(0)
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.1 Role + Phase machinery
+    # ───────────────────────────────────────────────────────────────────
+    def _role_of(self, deal_id: str, addr: Address) -> int:
+        if deal_id not in self.roles:
+            return int(Role.NONE)
+        bindings = self.roles[deal_id]
+        for i in range(len(bindings)):
+            b = bindings[i]
+            if b.addr == addr and int(b.revoked_at_seq) == 0:
+                return int(b.role)
+        # Platform is implicit on any deal
+        if addr == self.platform:
+            return int(Role.PLATFORM)
+        return int(Role.NONE)
+
+    def _require_role(self, deal_id: str, allowed: tuple) -> int:
+        role = self._role_of(deal_id, gl.message.sender_address)
+        if role not in allowed:
+            permitted_names = [ROLE_NAMES.get(int(r), str(int(r))) for r in allowed]
+            phase = self._deal_phase(deal_id)
+            _refuse(
+                actor=_hex_addr(gl.message.sender_address),
+                attempted=ROLE_NAMES.get(role, str(role)),
+                permitted=permitted_names,
+                deal=deal_id,
+                phase=phase,
+            )
+        return role
+
+    def _bind_role(self, deal_id: str, addr: Address, role: Role) -> None:
+        if deal_id not in self.roles:
+            self.roles.get_or_insert_default(deal_id)
+        b = RoleBinding(
+            deal_id=deal_id,
+            addr=addr,
+            role=u8(int(role)),
+            bound_at_seq=self.next_seq,
+            revoked_at_seq=u64(0),
+        )
+        lst = self.roles[deal_id]
+        lst.append(b)
+        self.roles[deal_id] = lst
+
+    def _deal_phase(self, deal_id: str) -> str:
+        if deal_id not in self.deals:
+            return "UNKNOWN"
+        return self.deals[deal_id].phase
+
+    def _set_phase(self, deal_id: str, new_phase: str) -> None:
+        if deal_id not in self.deals:
+            _escrow_err(f"unknown deal {deal_id}")
+        d = self.deals[deal_id]
+        old = d.phase
+        d.phase = new_phase
+        self.deals[deal_id] = d
+        if old in self.by_phase_counts:
+            self.by_phase_counts[old] = u32(max(0, int(self.by_phase_counts[old]) - 1))
+        if new_phase in self.by_phase_counts:
+            self.by_phase_counts[new_phase] = u32(int(self.by_phase_counts[new_phase]) + 1)
+        else:
+            self.by_phase_counts[new_phase] = u32(1)
+
+    def _require_phase(self, deal_id: str, allowed_phases: tuple) -> str:
+        ph = self._deal_phase(deal_id)
+        if ph not in allowed_phases:
+            _escrow_err(f"phase {ph} not in {list(allowed_phases)}")
+        return ph
+
+    def _prepare_milestone_settlement(
+        self,
+        deal_id: str,
+        m: Milestone,
+        seller_award: int,
+        buyer_award: int,
+    ) -> int:
+        """Commit one tranche to pull-payment balances without transferring yet."""
+        if m.released:
+            _escrow_err(f"milestone {int(m.idx)} already settled")
+        d = self.deals[deal_id]
+        tranche = (int(d.total) * int(m.share_bps)) // 10000
+        if seller_award < 0 or buyer_award < 0:
+            _escrow_err("negative settlement award")
+        if seller_award + buyer_award != tranche:
+            _escrow_err(
+                f"settlement awards {seller_award + buyer_award} do not equal tranche {tranche}"
+            )
+        if int(d.allocated) + tranche > int(d.total):
+            _escrow_err("milestone shares exceed funded escrow")
+
+        self.seller_claimable[deal_id] = u256(
+            int(self.seller_claimable.get(deal_id, u256(0))) + seller_award
+        )
+        self.buyer_claimable[deal_id] = u256(
+            int(self.buyer_claimable.get(deal_id, u256(0))) + buyer_award
+        )
+        d.allocated = u256(int(d.allocated) + tranche)
+        self.deals[deal_id] = d
+
+        m.seller_award = u256(seller_award)
+        m.buyer_award = u256(buyer_award)
+        m.released = True
+        self._replace_milestone(deal_id, m)
+        return tranche
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.2 LLM call wrappers
+    # ───────────────────────────────────────────────────────────────────
+
+    def _llm_milestone_coherence(
+        self,
+        *,
+        deal_id: str,
+        milestone_description: str,
+        notes: str,
+    ) -> dict:
+        def call():
+            prompt = (
+                "A witness has attested a milestone is OK and added notes. "
+                "Decide whether the notes COHERE with the declared milestone "
+                "description: are they describing the same deliverable?\n\n"
+                f"Deal: {deal_id}\n"
+                f"Milestone description: {milestone_description[:1024]}\n"
+                f"Witness notes: {notes[:1024]}\n\n"
+                "Return strict JSON: "
+                '{"coherent": <bool>, "rationale": "<=240 chars"}'
+            )
+            return gl.nondet.exec_prompt(prompt, response_format="json")
+
+        def validator(leaders_res):
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._agree_on_error(leaders_res, call)
+            d = leaders_res.calldata
+            if not isinstance(d, dict):
+                return False
+            mine = call()
+            return bool(d.get("coherent", False)) == bool(mine.get("coherent", False))
+
+        raw = gl.vm.run_nondet_unsafe(call, validator)
+        if not isinstance(raw, dict):
+            _llm_err("model returned non-dict for milestone coherence")
+        return {
+            "coherent": bool(raw.get("coherent", True)),
+            "rationale": _safe_str(raw.get("rationale", ""), 240),
+        }
+
+    def _llm_dispute_summary(self, *, deal_id: str, ground: str) -> dict:
+        def call():
+            prompt = (
+                "Normalize a free-text dispute statement into a short summary "
+                "suitable for arbiter prompts. Keep the core grievance, drop "
+                "filler.\n\n"
+                f"Deal: {deal_id}\n"
+                f"Ground: {ground[:1024]}\n\n"
+                "Return strict JSON: "
+                '{"summary": "<=240 chars"}'
+            )
+            return gl.nondet.exec_prompt(prompt, response_format="json")
+
+        def validator(leaders_res):
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._agree_on_error(leaders_res, call)
+            d = leaders_res.calldata
+            if not isinstance(d, dict):
+                return False
+            mine = call()
+            # summaries don't have to match word-for-word; only categorical
+            # agreement on "summary truthiness" (both non-empty)
+            return bool(str(d.get("summary", "")).strip()) == bool(str(mine.get("summary", "")).strip())
+
+        raw = gl.vm.run_nondet_unsafe(call, validator)
+        if not isinstance(raw, dict):
+            _llm_err("model returned non-dict for dispute summary")
+        return {"summary": _safe_str(raw.get("summary", ""), 240)}
+
+    def _llm_jury_verdict(
+        self,
+        *,
+        deal_id: str,
+        ground_summary: str,
+        findings: list,
+        evidence_text: str,
+    ) -> dict:
+        findings_text = json.dumps(findings, sort_keys=True)[:2048]
+        ev_text = evidence_text[:2048]
+
+        def call():
+            prompt = (
+                "You synthesize a final verdict for an escrow dispute given "
+                "arbiter findings and fetched evidence text. Pick BUYER_WINS, "
+                "SELLER_WINS, or SPLIT. If SPLIT, choose split_bps = share of "
+                "the disputed tranche to release to the seller (0..10000).\n\n"
+                f"Deal: {deal_id}\n"
+                f"Ground (summary): {ground_summary}\n"
+                f"Arbiter findings: {findings_text}\n"
+                f"Evidence excerpt: {ev_text}\n\n"
+                "Return strict JSON: "
+                '{"verdict": "BUYER_WINS|SELLER_WINS|SPLIT", '
+                '"split_bps": <int 0-10000>, '
+                '"reasoning": "<=480 chars"}'
+            )
+            return gl.nondet.exec_prompt(prompt, response_format="json")
+
+        def validator(leaders_res):
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._agree_on_error(leaders_res, call)
+            d = leaders_res.calldata
+            if not isinstance(d, dict):
+                return False
+            mine = call()
+            return _agree_on_split(d, mine)
+
+        raw = gl.vm.run_nondet_unsafe(call, validator)
+        if not isinstance(raw, dict):
+            _llm_err("model returned non-dict for jury verdict")
+        verdict = str(raw.get("verdict", "")).strip().upper()
+        if verdict not in VERDICT_VALUES:
+            _llm_err(f"bad verdict label: {verdict}")
+        split = _clamp(_safe_int(raw.get("split_bps", 0)), 0, 10000)
+        if verdict == VERDICT_BUYER_WINS:
+            split = 0
+        elif verdict == VERDICT_SELLER_WINS:
+            split = 10000
+        return {
+            "verdict": verdict,
+            "split_bps": split,
+            "reasoning": _safe_str(raw.get("reasoning", ""), 480),
+        }
+
+    def _agree_on_error(self, leaders_res, call_fn) -> bool:
+        leader_msg = getattr(leaders_res, "message", "") or str(leaders_res)
+        try:
+            call_fn()
+            return False
+        except gl.vm.UserError as e:
+            local_msg = getattr(e, "message", "") or str(e)
+            # Narrative-prefix agreement: match the part before the first ':'
+            l_prefix = leader_msg.split(":")[0]
+            local_prefix = local_msg.split(":")[0]
+            return l_prefix == local_prefix
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.3 Web fetches
+    # ───────────────────────────────────────────────────────────────────
+
+    def _fetch_milestones_doc(self, milestones_uri: str) -> dict:
+        def call():
+            try:
+                response = gl.nondet.web.get(
+                    milestones_uri, headers={"Accept": "application/json"},
+                )
+            except Exception as e:
+                _fetch_err(f"milestones_uri fail: {str(e)[:120]}", transient=True)
+            status = getattr(response, "status", 0)
+            if status >= 500:
+                _fetch_err(f"milestones_uri 5xx: {int(status)}", transient=True)
+            if status >= 400:
+                _fetch_err(f"milestones_uri 4xx: {int(status)}", transient=False)
+            body = getattr(response, "body", b"")
+            if isinstance(body, (bytes, bytearray)):
+                sha = hashlib.sha256(bytes(body)).hexdigest()
+            else:
+                sha = hashlib.sha256(str(body).encode("utf-8", errors="ignore")).hexdigest()
+            return {"sha256": sha, "status": int(status)}
+
+        def validator(leaders_res):
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._agree_on_error(leaders_res, call)
+            d = leaders_res.calldata
+            if not isinstance(d, dict):
+                return False
+            mine = call()
+            return str(d.get("sha256", "")) == str(mine.get("sha256", ""))
+
+        return gl.vm.run_nondet_unsafe(call, validator)
+
+    def _fetch_evidence_bundle(self, evidence_uri: str) -> dict:
+        def call():
+            try:
+                response = gl.nondet.web.get(
+                    evidence_uri, headers={"Accept": "*/*"},
+                )
+            except Exception as e:
+                _fetch_err(f"evidence fetch fail: {str(e)[:120]}", transient=True)
+            status = getattr(response, "status", 0)
+            if status >= 500:
+                _fetch_err(f"evidence 5xx: {int(status)}", transient=True)
+            if status >= 400:
+                _fetch_err(f"evidence 4xx: {int(status)}", transient=False)
+            body = getattr(response, "body", b"")
+            if isinstance(body, (bytes, bytearray)):
+                text = body.decode("utf-8", errors="ignore")[:4096]
+                sha = hashlib.sha256(bytes(body)).hexdigest()
+            else:
+                text = str(body)[:4096]
+                sha = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+            return {"text": text, "sha256": sha, "status": int(status)}
+
+        def validator(leaders_res):
+            if not isinstance(leaders_res, gl.vm.Return):
+                return self._agree_on_error(leaders_res, call)
+            d = leaders_res.calldata
+            if not isinstance(d, dict):
+                return False
+            mine = call()
+            return str(d.get("sha256", "")) == str(mine.get("sha256", ""))
+
+        return gl.vm.run_nondet_unsafe(call, validator)
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.4 PUBLIC WRITES
+    # ───────────────────────────────────────────────────────────────────
+
+    @gl.public.write.payable
+    def open_deal(
+        self,
+        seller: Address,
+        milestones_uri: str,
+        total: u256,
+        witness_required: bool,
+    ) -> str:
+        funded = int(gl.message.value)
+        if funded != int(total):
+            _escrow_err(f"funded {funded} must equal total {int(total)}")
+        if not _safe_str(milestones_uri, 1024):
+            _escrow_err("milestones_uri empty")
+
+        meta = self._fetch_milestones_doc(milestones_uri)
+
+        self.deal_counter = u64(int(self.deal_counter) + 1)
+        deal_id = hashlib.sha256(
+            f"deal|{int(self.deal_counter)}|{_hex_addr(gl.message.sender_address)}".encode("utf-8")
+        ).hexdigest()
+        d = Deal(
+            deal_id=deal_id,
+            buyer=gl.message.sender_address,
+            seller=seller,
+            witness=Address(b"\x00" * 20),
+            witness_required=bool(witness_required),
+            milestones_uri=_safe_str(milestones_uri, 1024),
+            milestones_doc_sha256=str(meta.get("sha256", "")),
+            total=u256(int(total)),
+            funded=u256(funded),
+            released=u256(0),
+            phase=PHASE_FUNDED,
+            opened_at_seq=self.next_seq,
+            allocated=u256(0),
+            refunded=u256(0),
+        )
+        self.deals[deal_id] = d
+        self.milestones.get_or_insert_default(deal_id)
+        self.attestations.get_or_insert_default(deal_id)
+        self.disputes_by_deal.get_or_insert_default(deal_id)
+        self.roles.get_or_insert_default(deal_id)
+        self._bind_role(deal_id, gl.message.sender_address, Role.BUYER)
+        self.by_phase_counts[PHASE_FUNDED] = u32(int(self.by_phase_counts.get(PHASE_FUNDED, u32(0))) + 1)
+        self.next_seq = u64(int(self.next_seq) + 1)
+        return deal_id
+
+    @gl.public.write
+    def accept_deal(self, deal_id: str) -> None:
+        if deal_id not in self.deals:
+            _escrow_err(f"unknown deal {deal_id}")
+        d = self.deals[deal_id]
+        if gl.message.sender_address != d.seller:
+            _refuse(
+                actor=_hex_addr(gl.message.sender_address),
+                attempted="ACCEPTOR",
+                permitted=["seller"],
+                deal=deal_id,
+                phase=d.phase,
+            )
+        if d.phase != PHASE_FUNDED:
+            _escrow_err(f"deal not in FUNDED phase: {d.phase}")
+        self._bind_role(deal_id, gl.message.sender_address, Role.SELLER)
+        self._set_phase(deal_id, PHASE_IN_PROGRESS)
+
+    @gl.public.write
+    def add_witness(self, deal_id: str, witness: Address) -> None:
+        role = self._require_role(deal_id, (Role.BUYER, Role.SELLER))
+        d = self.deals[deal_id]
+        if int(role) == int(Role.BUYER):
+            d.witness = witness
+            self.deals[deal_id] = d
+        # Bind the witness role once the witness address is registered on the
+        # deal (buyer sets it above; seller's call is idempotent).
+        if d.witness == witness:
+            self._bind_role(deal_id, witness, Role.WITNESS)
+
+    @gl.public.write
+    def declare_milestone(
+        self,
+        deal_id: str,
+        idx: u8,
+        description: str,
+        share_bps: u16,
+    ) -> None:
+        self._require_role(deal_id, (Role.SELLER,))
+        self._require_phase(deal_id, (PHASE_IN_PROGRESS,))
+        if int(share_bps) <= 0 or int(share_bps) > 10000:
+            _escrow_err(f"share_bps out of range: {int(share_bps)}")
+        lst = self.milestones[deal_id]
+        # Check idx not yet declared
+        for i in range(len(lst)):
+            if int(lst[i].idx) == int(idx):
+                _escrow_err(f"milestone idx {int(idx)} already declared")
+        m = Milestone(
+            deal_id=deal_id,
+            idx=u8(int(idx)),
+            description=_safe_str(description, 1024),
+            share_bps=u16(int(share_bps)),
+            declared=True,
+            witnessed_ok=False,
+            requested_release=False,
+            released=False,
+            coherence_rationale="",
+            seller_award=u256(0),
+            buyer_award=u256(0),
+        )
+        lst.append(m)
+        self.milestones[deal_id] = lst
+
+    @gl.public.write
+    def attest_milestone(self, deal_id: str, idx: u8, ok: bool, notes: str) -> None:
+        self._require_role(deal_id, (Role.WITNESS,))
+        self._require_phase(deal_id, (PHASE_IN_PROGRESS, PHASE_MILESTONE_REVIEW))
+        m = self._find_milestone(deal_id, int(idx))
+        if not m.declared:
+            _escrow_err(f"milestone {int(idx)} not declared")
+
+        if ok:
+            coh = self._llm_milestone_coherence(
+                deal_id=deal_id,
+                milestone_description=m.description,
+                notes=notes,
+            )
+            if not coh.get("coherent", False):
+                _llm_err(f"notes incoherent for milestone {int(idx)}: {coh.get('rationale', '')[:160]}")
+            m.witnessed_ok = True
+            m.coherence_rationale = coh.get("rationale", "")
+        else:
+            m.witnessed_ok = False
+
+        self._replace_milestone(deal_id, m)
+        att = Attestation(
+            deal_id=deal_id,
+            milestone_idx=u8(int(idx)),
+            witness=gl.message.sender_address,
+            ok=bool(ok),
+            notes=_safe_str(notes, 1024),
+            posted_at_seq=self.next_seq,
+        )
+        alst = self.attestations[deal_id]
+        alst.append(att)
+        self.attestations[deal_id] = alst
+        self.next_seq = u64(int(self.next_seq) + 1)
+
+    @gl.public.write
+    def request_release(self, deal_id: str, idx: u8) -> None:
+        self._require_role(deal_id, (Role.SELLER,))
+        self._require_phase(deal_id, (PHASE_IN_PROGRESS,))
+        m = self._find_milestone(deal_id, int(idx))
+        d = self.deals[deal_id]
+        if d.witness_required and not m.witnessed_ok:
+            _escrow_err(f"milestone {int(idx)} not witnessed yet")
+        m.requested_release = True
+        self._replace_milestone(deal_id, m)
+        self._set_phase(deal_id, PHASE_MILESTONE_REVIEW)
+
+    @gl.public.write
+    def release_milestone(self, deal_id: str, idx: u8) -> int:
+        self._require_role(deal_id, (Role.BUYER,))
+        self._require_phase(deal_id, (PHASE_MILESTONE_REVIEW,))
+        m = self._find_milestone(deal_id, int(idx))
+        if m.released:
+            _escrow_err(f"milestone {int(idx)} already released")
+        if not m.requested_release:
+            _escrow_err(f"milestone {int(idx)} release not requested")
+        d = self.deals[deal_id]
+        tranche = (int(d.total) * int(m.share_bps)) // 10000
+        self._prepare_milestone_settlement(
+            deal_id=deal_id,
+            m=m,
+            seller_award=tranche,
+            buyer_award=0,
+        )
+        # back to in-progress (or to closed if all milestones released)
+        if self._all_released(deal_id):
+            self._set_phase(deal_id, PHASE_CLOSED)
+        else:
+            self._set_phase(deal_id, PHASE_IN_PROGRESS)
+        return tranche
+
+    @gl.public.write.payable
+    def open_dispute(self, deal_id: str, idx: u8, ground: str, evidence_uri: str) -> str:
+        self._require_role(deal_id, (Role.BUYER, Role.SELLER))
+        self._require_phase(deal_id, (PHASE_IN_PROGRESS, PHASE_MILESTONE_REVIEW))
+        bond = int(gl.message.value)
+        if bond < 1:
+            _escrow_err("dispute bond required")
+        if not _safe_str(ground, 2048):
+            _escrow_err("ground empty")
+        milestone = self._find_milestone(deal_id, int(idx))
+        if milestone.released:
+            _escrow_err(f"milestone {int(idx)} already settled")
+
+        summary = self._llm_dispute_summary(deal_id=deal_id, ground=ground)
+
+        self.dispute_counter = u64(int(self.dispute_counter) + 1)
+        dispute_id = hashlib.sha256(
+            f"dispute|{deal_id}|{int(idx)}|{int(self.dispute_counter)}".encode("utf-8")
+        ).hexdigest()
+        dp = Dispute(
+            dispute_id=dispute_id,
+            deal_id=deal_id,
+            milestone_idx=u8(int(idx)),
+            opener=gl.message.sender_address,
+            ground=_safe_str(ground, 2048),
+            ground_summary=_safe_str(summary.get("summary", ""), 240),
+            evidence_uri=_safe_str(evidence_uri, 1024),
+            opened_at_seq=self.next_seq,
+            finalized_at_seq=u64(0),
+            final_verdict="",
+            final_split_bps=u32(0),
+            bond=u256(bond),
+            bond_recipient=Address(b"\x00" * 20),
+            bond_claimed=False,
+            opened_at_ts=u64(int(datetime.now(timezone.utc).timestamp())),
+            evidence_failed=False,
+            recovered=False,
+        )
+        self.disputes[dispute_id] = dp
+        lst = self.disputes_by_deal[deal_id]
+        lst.append(dispute_id)
+        self.disputes_by_deal[deal_id] = lst
+        self.findings_by_dispute.get_or_insert_default(dispute_id)
+        self._set_phase(deal_id, PHASE_DISPUTED)
+        self.next_seq = u64(int(self.next_seq) + 1)
+        return dispute_id
+
+    @gl.public.write
+    def assign_arbiter(self, deal_id: str, addr: Address) -> None:
+        self._require_role(deal_id, (Role.PLATFORM,))
+        self._require_phase(deal_id, (PHASE_DISPUTED, PHASE_ARBITRATING))
+        self._bind_role(deal_id, addr, Role.ARBITER)
+        if self._deal_phase(deal_id) == PHASE_DISPUTED:
+            self._set_phase(deal_id, PHASE_ARBITRATING)
+
+    @gl.public.write
+    def file_arbiter_finding(self, deal_id: str, dispute_id: str, lean: str, notes: str) -> str:
+        self._require_role(deal_id, (Role.ARBITER,))
+        self._require_phase(deal_id, (PHASE_ARBITRATING,))
+        if dispute_id not in self.disputes:
+            _arb_err(f"unknown dispute {dispute_id}")
+        finding_id = hashlib.sha256(
+            f"finding|{dispute_id}|{_hex_addr(gl.message.sender_address)}|{int(self.next_seq)}".encode("utf-8")
+        ).hexdigest()
+        f = ArbiterFinding(
+            deal_id=deal_id,
+            dispute_id=dispute_id,
+            arbiter=gl.message.sender_address,
+            lean=_safe_str(lean, 96),
+            notes=_safe_str(notes, 1024),
+            posted_at_seq=self.next_seq,
+        )
+        self.findings[finding_id] = f
+        lst = self.findings_by_dispute[dispute_id]
+        lst.append(finding_id)
+        self.findings_by_dispute[dispute_id] = lst
+        self.next_seq = u64(int(self.next_seq) + 1)
+        return finding_id
+
+    @gl.public.write
+    def finalize_dispute(self, deal_id: str, dispute_id: str) -> str:
+        self._require_phase(deal_id, (PHASE_ARBITRATING,))
+        if dispute_id not in self.disputes:
+            _arb_err(f"unknown dispute {dispute_id}")
+        dp = self.disputes[dispute_id]
+        if int(dp.finalized_at_seq) > 0:
+            _arb_err("already finalized")
+        finding_ids = self.findings_by_dispute[dispute_id]
+        if len(finding_ids) < QUORUM_ARBITERS:
+            _arb_err(f"quorum {QUORUM_ARBITERS} not met, have {len(finding_ids)}")
+
+        findings_list = []
+        for i in range(len(finding_ids)):
+            fid = finding_ids[i]
+            if fid in self.findings:
+                f = self.findings[fid]
+                findings_list.append({
+                    "arbiter": _hex_addr(f.arbiter),
+                    "lean": f.lean,
+                    "notes": f.notes[:480],
+                })
+
+        evidence_text = ""
+        evidence_failed = False
+        if dp.evidence_uri:
+            try:
+                ev = self._fetch_evidence_bundle(dp.evidence_uri)
+                evidence_text = str(ev.get("text", ""))
+            except gl.vm.UserError:
+                # evidence fetch failure does not stop arbitration; we proceed
+                # with empty evidence_text.
+                evidence_text = ""
+                evidence_failed = True
+
+        result = self._llm_jury_verdict(
+            deal_id=deal_id,
+            ground_summary=dp.ground_summary,
+            findings=findings_list,
+            evidence_text=evidence_text,
+        )
+
+        dp.final_verdict = result["verdict"]
+        dp.final_split_bps = u32(int(result["split_bps"]))
+        dp.finalized_at_seq = self.next_seq
+        dp.evidence_failed = evidence_failed
+
+        # Commit the verdict to pull-payment balances. GEN leaves the contract
+        # only when the authorized party claims it.
+        m = self._find_milestone(deal_id, int(dp.milestone_idx))
+        d = self.deals[deal_id]
+        tranche = (int(d.total) * int(m.share_bps)) // 10000
+        seller_share = (tranche * int(dp.final_split_bps)) // 10000
+        buyer_share = tranche - seller_share
+        self._prepare_milestone_settlement(
+            deal_id=deal_id,
+            m=m,
+            seller_award=seller_share,
+            buyer_award=buyer_share,
+        )
+
+        if result["verdict"] == VERDICT_SELLER_WINS:
+            dp.bond_recipient = d.seller
+        elif result["verdict"] == VERDICT_BUYER_WINS:
+            dp.bond_recipient = d.buyer
+        else:
+            dp.bond_recipient = dp.opener
+        self.disputes[dispute_id] = dp
+        if self._all_released(deal_id):
+            self._set_phase(deal_id, PHASE_CLOSED)
+        else:
+            self._set_phase(deal_id, PHASE_IN_PROGRESS)
+
+        self.next_seq = u64(int(self.next_seq) + 1)
+        return result["verdict"]
+
+    @gl.public.write
+    def recover_timed_out_dispute(self, deal_id: str, dispute_id: str) -> int:
+        """Refund a stalled disputed tranche after the deterministic deadline."""
+        self._require_role(deal_id, (Role.BUYER, Role.SELLER))
+        self._require_phase(deal_id, (PHASE_DISPUTED, PHASE_ARBITRATING))
+        if dispute_id not in self.disputes:
+            _arb_err(f"unknown dispute {dispute_id}")
+        dp = self.disputes[dispute_id]
+        if dp.deal_id != deal_id:
+            _arb_err("dispute does not belong to deal")
+        if int(dp.finalized_at_seq) > 0 or dp.recovered:
+            _arb_err("dispute already resolved")
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        unlock_ts = int(dp.opened_at_ts) + DISPUTE_RECOVERY_TIMEOUT_SECONDS
+        if now_ts < unlock_ts:
+            _arb_err(f"recovery not available before {unlock_ts}")
+
+        m = self._find_milestone(deal_id, int(dp.milestone_idx))
+        d = self.deals[deal_id]
+        tranche = (int(d.total) * int(m.share_bps)) // 10000
+        self._prepare_milestone_settlement(
+            deal_id=deal_id,
+            m=m,
+            seller_award=0,
+            buyer_award=tranche,
+        )
+
+        dp.final_verdict = VERDICT_RECOVERY_REFUND
+        dp.final_split_bps = u32(0)
+        dp.finalized_at_seq = self.next_seq
+        dp.bond_recipient = dp.opener
+        dp.recovered = True
+        self.disputes[dispute_id] = dp
+
+        if self._all_released(deal_id):
+            self._set_phase(deal_id, PHASE_CLOSED)
+        else:
+            self._set_phase(deal_id, PHASE_IN_PROGRESS)
+        self.next_seq = u64(int(self.next_seq) + 1)
+        return tranche
+
+    @gl.public.write
+    def claim_seller_payout(self, deal_id: str) -> int:
+        self._require_role(deal_id, (Role.SELLER,))
+        amount = int(self.seller_claimable.get(deal_id, u256(0)))
+        if amount <= 0:
+            _escrow_err("no seller payout claimable")
+        d = self.deals[deal_id]
+        if int(d.released) + int(d.refunded) + amount > int(d.funded):
+            _escrow_err("seller payout exceeds funded escrow")
+
+        # Checks-effects-interactions: zero claimable before emitting value.
+        self.seller_claimable[deal_id] = u256(0)
+        d.released = u256(int(d.released) + amount)
+        self.deals[deal_id] = d
+        _Payee(d.seller).emit_transfer(value=u256(amount))
+        return amount
+
+    @gl.public.write
+    def claim_buyer_refund(self, deal_id: str) -> int:
+        self._require_role(deal_id, (Role.BUYER,))
+        amount = int(self.buyer_claimable.get(deal_id, u256(0)))
+        if amount <= 0:
+            _escrow_err("no buyer refund claimable")
+        d = self.deals[deal_id]
+        if int(d.released) + int(d.refunded) + amount > int(d.funded):
+            _escrow_err("buyer refund exceeds funded escrow")
+
+        self.buyer_claimable[deal_id] = u256(0)
+        d.refunded = u256(int(d.refunded) + amount)
+        self.deals[deal_id] = d
+        _Payee(d.buyer).emit_transfer(value=u256(amount))
+        return amount
+
+    @gl.public.write
+    def claim_dispute_bond(self, dispute_id: str) -> int:
+        if dispute_id not in self.disputes:
+            _arb_err(f"unknown dispute {dispute_id}")
+        dp = self.disputes[dispute_id]
+        if int(dp.finalized_at_seq) == 0:
+            _arb_err("dispute not resolved")
+        if dp.bond_claimed:
+            _arb_err("bond already claimed")
+        if gl.message.sender_address != dp.bond_recipient:
+            _arb_err("only bond recipient may claim")
+        amount = int(dp.bond)
+        if amount <= 0:
+            _arb_err("no dispute bond claimable")
+
+        recipient = dp.bond_recipient
+        dp.bond = u256(0)
+        dp.bond_claimed = True
+        self.disputes[dispute_id] = dp
+        _Payee(recipient).emit_transfer(value=u256(amount))
+        return amount
+
+    @gl.public.write
+    def void_deal(self, deal_id: str, reason: str) -> int:
+        self._require_role(deal_id, (Role.PLATFORM,))
+        d = self.deals[deal_id]
+        if d.phase == PHASE_CLOSED or d.phase == PHASE_VOID:
+            _escrow_err(f"deal already terminal: {d.phase}")
+        remaining = int(d.funded) - int(d.allocated)
+        if remaining < 0:
+            _escrow_err("allocated escrow exceeds funding")
+        self.buyer_claimable[deal_id] = u256(
+            int(self.buyer_claimable.get(deal_id, u256(0))) + remaining
+        )
+        d.allocated = d.funded
+        self.deals[deal_id] = d
+        self._set_phase(deal_id, PHASE_VOID)
+        return remaining
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.5 Internal milestone helpers
+    # ───────────────────────────────────────────────────────────────────
+    def _find_milestone(self, deal_id: str, idx: int) -> Milestone:
+        if deal_id not in self.milestones:
+            _escrow_err(f"deal has no milestones array: {deal_id}")
+        lst = self.milestones[deal_id]
+        for i in range(len(lst)):
+            if int(lst[i].idx) == idx:
+                return lst[i]
+        _escrow_err(f"milestone idx {idx} not found")
+
+    def _replace_milestone(self, deal_id: str, m: Milestone) -> None:
+        lst = self.milestones[deal_id]
+        for i in range(len(lst)):
+            if int(lst[i].idx) == int(m.idx):
+                lst[i] = m
+                self.milestones[deal_id] = lst
+                return
+        _escrow_err(f"milestone idx {int(m.idx)} not found in replace")
+
+    def _all_released(self, deal_id: str) -> bool:
+        lst = self.milestones[deal_id]
+        if len(lst) == 0:
+            return False
+        for i in range(len(lst)):
+            if not lst[i].released:
+                return False
+        return True
+
+    # ───────────────────────────────────────────────────────────────────
+    # 6.6 PUBLIC VIEWS
+    # ───────────────────────────────────────────────────────────────────
+
+    @gl.public.view
+    def deal(self, deal_id: str) -> dict:
+        if deal_id not in self.deals:
+            return {"deal_id": deal_id, "exists": False}
+        d = self.deals[deal_id]
+        return {
+            "deal_id": d.deal_id,
+            "exists": True,
+            "buyer": _hex_addr(d.buyer),
+            "seller": _hex_addr(d.seller),
+            "witness": _hex_addr(d.witness),
+            "witness_required": bool(d.witness_required),
+            "milestones_uri": d.milestones_uri,
+            "milestones_doc_sha256": d.milestones_doc_sha256,
+            "total": int(d.total),
+            "funded": int(d.funded),
+            "allocated": int(d.allocated),
+            "released": int(d.released),
+            "refunded": int(d.refunded),
+            "escrow_balance": int(d.funded) - int(d.released) - int(d.refunded),
+            "seller_claimable": int(self.seller_claimable.get(deal_id, u256(0))),
+            "buyer_claimable": int(self.buyer_claimable.get(deal_id, u256(0))),
+            "phase": d.phase,
+            "opened_at_seq": int(d.opened_at_seq),
+        }
+
+    @gl.public.view
+    def milestones_of(self, deal_id: str) -> list:
+        if deal_id not in self.milestones:
+            return []
+        lst = self.milestones[deal_id]
+        out = []
+        for i in range(len(lst)):
+            m = lst[i]
+            out.append({
+                "idx": int(m.idx),
+                "description": m.description,
+                "share_bps": int(m.share_bps),
+                "declared": bool(m.declared),
+                "witnessed_ok": bool(m.witnessed_ok),
+                "requested_release": bool(m.requested_release),
+                "released": bool(m.released),
+                "coherence_rationale": m.coherence_rationale,
+                "seller_award": int(m.seller_award),
+                "buyer_award": int(m.buyer_award),
+            })
+        return out
+
+    @gl.public.view
+    def role_of(self, deal_id: str, addr: Address) -> str:
+        return ROLE_NAMES.get(self._role_of(deal_id, addr), "NONE")
+
+    @gl.public.view
+    def participants(self, deal_id: str) -> dict:
+        if deal_id not in self.deals:
+            return {}
+        d = self.deals[deal_id]
+        return {
+            "buyer": _hex_addr(d.buyer),
+            "seller": _hex_addr(d.seller),
+            "witness": _hex_addr(d.witness),
+            "platform": _hex_addr(self.platform),
+        }
+
+    @gl.public.view
+    def dispute(self, dispute_id: str) -> dict:
+        if dispute_id not in self.disputes:
+            return {"dispute_id": dispute_id, "exists": False}
+        dp = self.disputes[dispute_id]
+        return {
+            "dispute_id": dp.dispute_id,
+            "exists": True,
+            "deal_id": dp.deal_id,
+            "milestone_idx": int(dp.milestone_idx),
+            "opener": _hex_addr(dp.opener),
+            "ground": dp.ground,
+            "ground_summary": dp.ground_summary,
+            "evidence_uri": dp.evidence_uri,
+            "opened_at_seq": int(dp.opened_at_seq),
+            "finalized_at_seq": int(dp.finalized_at_seq),
+            "final_verdict": dp.final_verdict,
+            "final_split_bps": int(dp.final_split_bps),
+            "bond": int(dp.bond),
+            "bond_recipient": _hex_addr(dp.bond_recipient),
+            "bond_claimed": bool(dp.bond_claimed),
+            "opened_at_ts": int(dp.opened_at_ts),
+            "evidence_failed": bool(dp.evidence_failed),
+            "recovered": bool(dp.recovered),
+        }
+
+    @gl.public.view
+    def tranche_state(self, deal_id: str, idx: u32) -> dict:
+        try:
+            m = self._find_milestone(deal_id, int(idx))
+        except gl.vm.UserError:
+            return {"deal_id": deal_id, "idx": int(idx), "exists": False}
+        d = self.deals[deal_id]
+        tranche = (int(d.total) * int(m.share_bps)) // 10000
+        return {
+            "deal_id": deal_id,
+            "idx": int(m.idx),
+            "exists": True,
+            "share_bps": int(m.share_bps),
+            "tranche_value": tranche,
+            "released": bool(m.released),
+            "requested_release": bool(m.requested_release),
+            "witnessed_ok": bool(m.witnessed_ok),
+            "seller_award": int(m.seller_award),
+            "buyer_award": int(m.buyer_award),
+            "seller_claimable": int(self.seller_claimable.get(deal_id, u256(0))),
+            "buyer_claimable": int(self.buyer_claimable.get(deal_id, u256(0))),
+        }
+
+    @gl.public.view
+    def platform_summary(self) -> dict:
+        counts = {}
+        for p in PHASES_ALL:
+            counts[p] = int(self.by_phase_counts.get(p, u32(0)))
+        return {
+            "platform": _hex_addr(self.platform),
+            "deals_total": int(self.deal_counter),
+            "disputes_total": int(self.dispute_counter),
+            "phase_counts": counts,
+        }

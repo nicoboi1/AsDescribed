@@ -1,0 +1,14 @@
+{
+  "network": "testnet-bradbury",
+  "chainId": 4221,
+  "rpcUrl": "https://rpc-bradbury.genlayer.com",
+  "explorerUrl": "https://explorer-bradbury.genlayer.com/",
+  "contractAddress": "0x9f5f20c298415d3fd653867ab1b27a10184358b9",
+  "deploymentTransactionId": "0xee6b87b6b46662b58e03c4909fb10e2784a737a7c40838f7f934aa40adb6dbf7",
+  "submissionTransactionHash": "0xad7b9589630896217eec2446713e20c6986fe8ea719139bd123510a616b1ff21",
+  "finalizationTransactionHash": "0x55c5548c990eadce914d1d196f292528c178f05a982d71cf97779978e6796329",
+  "deployer": "0xee293185ade625beb6a888712b403943cd65e71c",
+  "status": "FINALIZED",
+  "executionResult": "FINISHED_WITH_RETURN",
+  "deployedAt": "2026-07-28"
+}

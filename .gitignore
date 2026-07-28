@@ -1,21 +1,22 @@
-.env
-.env.*
-!.env.example
-.venv*/
+# dependencies / build output
 node_modules/
 dist/
-*.log
-artifacts/
-.pytest_cache/
-__pycache__/
-*.py[cod]
-.DS_Store
-.idea/
-.vscode/
-.codex/
-.vercel/
-releases/
-*.zip
+.vite_cache/
 *.tsbuildinfo
 
-.vercel
+# env — commit .env and .env.example only; never local overrides
+.env.local
+.env.*.local
+
+# vercel
+.vercel/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# os / logs
+.DS_Store
+Thumbs.db
+*.log

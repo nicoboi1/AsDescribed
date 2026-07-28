@@ -1,1 +1,118 @@
-﻿.card {  display: block;  width: 100%;  text-align: left;  background: transparent;  border: 0;  border-bottom: 1px solid var(--line);  border-radius: 0;  padding: 20px 16px 20px 4px;  position: relative;  transition: background 0.3s var(--ease), padding-left 0.3s var(--ease);}.card:hover {  background: rgba(184, 134, 11, 0.05);  padding-left: 12px;}.card.on {  background: rgba(184, 134, 11, 0.07);}.card.on::before {  content: "";  position: absolute;  left: 0;  top: 0;  bottom: 0;  width: 2px;  background: var(--brass);}.head {  display: flex;  align-items: center;  justify-content: space-between;  gap: 10px;  margin-bottom: 12px;}.id {  font-size: 13px;  color: var(--ink-soft);  letter-spacing: 0.02em;}.pill {  display: inline-flex;  align-items: center;  gap: 7px;  font-family: var(--mono);  font-size: 10px;  text-transform: uppercase;  letter-spacing: 0.14em;  padding: 5px 11px;  border-radius: 999px;  border: 1px solid;  white-space: nowrap;}.dot {  width: 6px;  height: 6px;  border-radius: 50%;}.parties {  display: flex;  align-items: center;  gap: 14px;  margin-bottom: 14px;}.parties span {  display: flex;  flex-direction: column;  gap: 2px;}.parties i {  font-style: normal;  font-family: var(--mono);  font-size: 9px;  text-transform: uppercase;  letter-spacing: 0.16em;  color: var(--ink-faint);}.parties b {  font-weight: 500;  font-size: 14px;}.arrow {  color: var(--brass);  font-size: 17px;  align-self: center;}.bar {  height: 4px;  background: var(--parchment-3);  border-radius: 3px;  overflow: hidden;  margin-bottom: 10px;}.bar i {  display: block;  height: 100%;  background: linear-gradient(90deg, var(--brass-dim), var(--brass));}.meta {  display: flex;  justify-content: space-between;  align-items: center;  gap: 8px;  font-size: 12px;  color: var(--ink-soft);}.role {  font-family: var(--mono);  font-size: 9.5px;  text-transform: uppercase;  letter-spacing: 0.14em;  color: var(--brass-dim);}
+.card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: 20px 16px 20px 4px;
+  position: relative;
+  transition: background 0.3s var(--ease), padding-left 0.3s var(--ease);
+}
+.card:hover {
+  background: rgba(184, 134, 11, 0.05);
+  padding-left: 12px;
+}
+.card.on {
+  background: rgba(184, 134, 11, 0.07);
+}
+.card.on::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--brass);
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.id {
+  font-size: 13px;
+  color: var(--ink-soft);
+  letter-spacing: 0.02em;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.parties {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.parties span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.parties i {
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--ink-faint);
+}
+.parties b {
+  font-weight: 500;
+  font-size: 14px;
+}
+.arrow {
+  color: var(--brass);
+  font-size: 17px;
+  align-self: center;
+}
+
+.bar {
+  height: 4px;
+  background: var(--parchment-3);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.bar i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--brass-dim), var(--brass));
+}
+
+.meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.role {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--brass-dim);
+}

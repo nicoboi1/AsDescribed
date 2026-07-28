@@ -25,8 +25,11 @@ A single basis-point split drives both the jury verdict and the on-chain allocat
 
 ## Live deployment
 
-- **Network**: GenLayer Studionet (chain id 61999)
-- **Contract**: `0x52A5839F38e2D9a234ad95Ee11A306CA1A2cd841`
+- **Network**: GenLayer Bradbury Testnet (chain id 4221)
+- **Contract**: `0x9f5f20c298415d3fd653867ab1b27a10184358b9`
+- **Deployment transaction**: `0xee6b87b6b46662b58e03c4909fb10e2784a737a7c40838f7f934aa40adb6dbf7`
+- **Finalization transaction**: `0x55c5548c990eadce914d1d196f292528c178f05a982d71cf97779978e6796329`
+- **Execution**: finalized on Bradbury with `FINISHED_WITH_RETURN`
 - **App**: https://paprrika.github.io/escrow-judge/
 ## Run locally
 
@@ -37,15 +40,15 @@ npm run dev
 npm run build
 ```
 
-The committed `.env` holds the public Studionet config; no secrets are required. Copy `.env.example` to `.env.local` only to override.
+The source defaults and `.env.example` hold the public Bradbury config; no secrets are required. Copy `.env.example` to `.env.local` only to override.
 
 ## Environment variables
 
 | Name | Required | Description |
 |------|----------|-------------|
-| `VITE_CONTRACT_ADDRESS` | yes | Deployed EscrowArbiter contract on Studionet |
-| `VITE_CHAIN_ID` | yes | GenLayer chain id (61999) |
-| `VITE_RPC_URL` | yes | Studionet JSON-RPC endpoint |
+| `VITE_CONTRACT_ADDRESS` | yes | Deployed EscrowArbiter contract on Bradbury |
+| `VITE_CHAIN_ID` | yes | GenLayer chain id (4221) |
+| `VITE_RPC_URL` | yes | Bradbury JSON-RPC endpoint |
 
 ## Deploy the contract
 
@@ -81,7 +84,7 @@ npx genlayer deploy --contract backend/escrow-judge.py
 | `tranche_state` | view | Computed tranche value and release flags for a milestone. |
 | `platform_summary` | view | Platform address, deal and dispute totals, and phase counts. |
 
-The contract ABI changed. Redeploy `backend/escrow-judge.py` and point the frontend at the new address before using these settlement actions. The previous Studionet deployment does not contain the claim or timeout-recovery methods.
+The frontend is configured for the Bradbury deployment above. The previous Studionet deployment does not contain the claim or timeout-recovery methods and must not be used for settlement.
 
 ## Tests
 
