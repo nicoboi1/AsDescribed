@@ -1,0 +1,1 @@
+﻿networks:  default: localnet  localnet: {}  studionet: {}  testnet_bradbury: {}paths:  contracts: backend  artifacts: artifactsenvironment: .env

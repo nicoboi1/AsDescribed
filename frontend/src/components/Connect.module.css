@@ -1,0 +1,1 @@
+﻿/* Keep RainbowKit's connect control aligned with the registry desk and   override its tokens to the Stone & Scales palette (see [data-rk] in index.css). */.wrap {  display: flex;  align-items: center;}.wrap :global(button) {  font-family: var(--serif) !important;  letter-spacing: -0.01em;}

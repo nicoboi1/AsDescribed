@@ -1,0 +1,1 @@
+﻿# dependencies / build outputnode_modules/dist/.vite_cache/*.tsbuildinfo# env ÔÇö commit .env and .env.example only; never local overrides.env.local.env.*.local# vercel.vercel/# python__pycache__/*.pyc.pytest_cache/# os / logs.DS_StoreThumbs.db*.log

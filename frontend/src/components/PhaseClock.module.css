@@ -1,0 +1,1 @@
+﻿.wrap {  display: flex;  flex-direction: column;  gap: 10px;}.svg {  width: 100%;  height: auto;}.foot {  display: flex;  justify-content: space-between;  font-size: 10.5px;  text-transform: uppercase;  letter-spacing: 0.14em;  color: var(--ink-faint);  border-top: 1px dashed var(--line);  padding-top: 8px;}
