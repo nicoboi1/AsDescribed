@@ -1,7 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import s from "./DisputeDrawer.module.css";
 import type { DisputeView } from "../types";
-import { shortAddr, verdictColor, verdictLabel } from "../lib";
+import { shortAddr, verdictColor, verdictLabel, weiToGen } from "../lib";
 
 interface Props {
   open: boolean;
@@ -10,6 +10,9 @@ interface Props {
 }
 
 export function DisputeDrawer({ open, dispute, onClose }: Props) {
+  const recoveryAt = dispute
+    ? dispute.opened_at_ts + 7 * 24 * 60 * 60
+    : 0;
   return (
     <AnimatePresence>
       {open && dispute && dispute.exists && (
@@ -61,8 +64,33 @@ export function DisputeDrawer({ open, dispute, onClose }: Props) {
                 <a className="mono" href={dispute.evidence_uri} target="_blank" rel="noreferrer">
                   {dispute.evidence_uri.slice(0, 46)}
                 </a>
+                <p className={s.note}>
+                  Fetch status: {dispute.evidence_failed ? "unavailable — fallback used" : "no recorded failure"}
+                </p>
               </div>
             )}
+
+            <div className={s.section}>
+              <span className={s.lbl}>recovery deadline</span>
+              <p className="mono">
+                {new Date(recoveryAt * 1000).toLocaleString()}
+              </p>
+              <p className={s.note}>
+                After this deadline, either party can recover without fetching the evidence URL.
+              </p>
+            </div>
+
+            <div className={s.section}>
+              <span className={s.lbl}>dispute bond</span>
+              <p className="mono">
+                {weiToGen(dispute.bond_claimable)} GEN claimable of{" "}
+                {weiToGen(dispute.bond_total)} GEN
+              </p>
+              <p className={s.note}>
+                Recipient: {shortAddr(dispute.bond_claimable_recipient)}
+                {dispute.bond_claimed ? " · claimed" : ""}
+              </p>
+            </div>
 
             <div className={s.section}>
               <span className={s.lbl}>arbiter findings</span>

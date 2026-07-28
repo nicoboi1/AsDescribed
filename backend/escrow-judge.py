@@ -84,6 +84,14 @@ PHASES_ALL = (
     PHASE_SETTLING, PHASE_CLOSED, PHASE_VOID,
 )
 
+# Claims may remain available while another milestone is under review or
+# dispute. FUNDED is intentionally excluded because no award can exist until
+# the seller has accepted and settlement has allocated a tranche.
+PHASES_CLAIMABLE = (
+    PHASE_IN_PROGRESS, PHASE_MILESTONE_REVIEW, PHASE_DISPUTED,
+    PHASE_ARBITRATING, PHASE_SETTLING, PHASE_CLOSED, PHASE_VOID,
+)
+
 VERDICT_BUYER_WINS = "BUYER_WINS"
 VERDICT_SELLER_WINS = "SELLER_WINS"
 VERDICT_SPLIT = "SPLIT"
@@ -289,6 +297,7 @@ class Dispute:
     opened_at_ts: u64
     evidence_failed: bool
     recovered: bool
+    bond_total: u256
 
 
 @allow_storage
@@ -874,6 +883,7 @@ class EscrowArbiter(gl.Contract):
             opened_at_ts=u64(int(datetime.now(timezone.utc).timestamp())),
             evidence_failed=False,
             recovered=False,
+            bond_total=u256(bond),
         )
         self.disputes[dispute_id] = dp
         lst = self.disputes_by_deal[deal_id]
@@ -898,6 +908,8 @@ class EscrowArbiter(gl.Contract):
         self._require_phase(deal_id, (PHASE_ARBITRATING,))
         if dispute_id not in self.disputes:
             _arb_err(f"unknown dispute {dispute_id}")
+        if self.disputes[dispute_id].deal_id != deal_id:
+            _arb_err("dispute does not belong to deal")
         finding_id = hashlib.sha256(
             f"finding|{dispute_id}|{_hex_addr(gl.message.sender_address)}|{int(self.next_seq)}".encode("utf-8")
         ).hexdigest()
@@ -922,6 +934,8 @@ class EscrowArbiter(gl.Contract):
         if dispute_id not in self.disputes:
             _arb_err(f"unknown dispute {dispute_id}")
         dp = self.disputes[dispute_id]
+        if dp.deal_id != deal_id:
+            _arb_err("dispute does not belong to deal")
         if int(dp.finalized_at_seq) > 0:
             _arb_err("already finalized")
         finding_ids = self.findings_by_dispute[dispute_id]
@@ -1037,6 +1051,7 @@ class EscrowArbiter(gl.Contract):
     @gl.public.write
     def claim_seller_payout(self, deal_id: str) -> int:
         self._require_role(deal_id, (Role.SELLER,))
+        self._require_phase(deal_id, PHASES_CLAIMABLE)
         amount = int(self.seller_claimable.get(deal_id, u256(0)))
         if amount <= 0:
             _escrow_err("no seller payout claimable")
@@ -1054,6 +1069,7 @@ class EscrowArbiter(gl.Contract):
     @gl.public.write
     def claim_buyer_refund(self, deal_id: str) -> int:
         self._require_role(deal_id, (Role.BUYER,))
+        self._require_phase(deal_id, PHASES_CLAIMABLE)
         amount = int(self.buyer_claimable.get(deal_id, u256(0)))
         if amount <= 0:
             _escrow_err("no buyer refund claimable")
@@ -1072,6 +1088,8 @@ class EscrowArbiter(gl.Contract):
         if dispute_id not in self.disputes:
             _arb_err(f"unknown dispute {dispute_id}")
         dp = self.disputes[dispute_id]
+        self._require_role(dp.deal_id, (Role.BUYER, Role.SELLER))
+        self._require_phase(dp.deal_id, PHASES_CLAIMABLE)
         if int(dp.finalized_at_seq) == 0:
             _arb_err("dispute not resolved")
         if dp.bond_claimed:
@@ -1134,7 +1152,11 @@ class EscrowArbiter(gl.Contract):
         for i in range(len(lst)):
             if not lst[i].released:
                 return False
-        return True
+        # Do not enter CLOSED while any unallocated deal escrow remains. This
+        # keeps the seller free to declare the missing tranches and keeps the
+        # platform's void/refund recovery path available.
+        d = self.deals[deal_id]
+        return int(d.allocated) == int(d.funded)
 
     # ───────────────────────────────────────────────────────────────────
     # 6.6 PUBLIC VIEWS
@@ -1145,6 +1167,8 @@ class EscrowArbiter(gl.Contract):
         if deal_id not in self.deals:
             return {"deal_id": deal_id, "exists": False}
         d = self.deals[deal_id]
+        remaining = int(d.funded) - int(d.released) - int(d.refunded)
+        unallocated = int(d.funded) - int(d.allocated)
         return {
             "deal_id": d.deal_id,
             "exists": True,
@@ -1159,7 +1183,9 @@ class EscrowArbiter(gl.Contract):
             "allocated": int(d.allocated),
             "released": int(d.released),
             "refunded": int(d.refunded),
-            "escrow_balance": int(d.funded) - int(d.released) - int(d.refunded),
+            "escrow_balance": remaining,
+            "remaining_escrow_balance": remaining,
+            "unallocated_escrow": unallocated,
             "seller_claimable": int(self.seller_claimable.get(deal_id, u256(0))),
             "buyer_claimable": int(self.buyer_claimable.get(deal_id, u256(0))),
             "phase": d.phase,
@@ -1223,7 +1249,10 @@ class EscrowArbiter(gl.Contract):
             "final_verdict": dp.final_verdict,
             "final_split_bps": int(dp.final_split_bps),
             "bond": int(dp.bond),
+            "bond_total": int(dp.bond_total),
+            "bond_claimable": int(dp.bond),
             "bond_recipient": _hex_addr(dp.bond_recipient),
+            "bond_claimable_recipient": _hex_addr(dp.bond_recipient),
             "bond_claimed": bool(dp.bond_claimed),
             "opened_at_ts": int(dp.opened_at_ts),
             "evidence_failed": bool(dp.evidence_failed),

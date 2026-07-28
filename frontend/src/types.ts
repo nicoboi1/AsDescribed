@@ -50,6 +50,8 @@ export interface DealView {
   released: number;
   refunded: number;
   escrow_balance: number;
+  remaining_escrow_balance: number;
+  unallocated_escrow: number;
   seller_claimable: number;
   buyer_claimable: number;
   phase: Phase;
@@ -90,7 +92,10 @@ export interface DisputeView {
   final_verdict: Verdict;
   final_split_bps: number;
   bond: number;
+  bond_total: number;
+  bond_claimable: number;
   bond_recipient: string;
+  bond_claimable_recipient: string;
   bond_claimed: boolean;
   opened_at_ts: number;
   evidence_failed: boolean;

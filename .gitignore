@@ -3,8 +3,14 @@ node_modules/
 dist/
 .vite_cache/
 *.tsbuildinfo
+artifacts/
+.venv/
 
-# env — commit .env and .env.example only; never local overrides
+# env and wallet material — commit examples only
+.env
+.env.*
+!.env.example
+!frontend/.env.example
 .env.local
 .env.*.local
 
@@ -15,6 +21,9 @@ dist/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# release packages are generated locally
+*.zip
 
 # os / logs
 .DS_Store

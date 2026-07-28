@@ -426,10 +426,14 @@ export function AppPage() {
                     witnessRequired={sel.witness_required}
                   />
                   <div className={s.facts}>
-                    <div className="kv"><span>phase</span><PhasePill phase={sel.phase} /></div>
-                    <div className="kv"><span>escrow total</span><b className="mono">{weiToGen(sel.total)} GEN</b></div>
-                    <div className="kv"><span>funded</span><b className="mono">{weiToGen(sel.funded)} GEN</b></div>
-                    <div className="kv"><span>released</span><b className="mono">{weiToGen(sel.released)} GEN</b></div>
+                    <div className="kv"><span>status / phase</span><PhasePill phase={sel.phase} /></div>
+                    <div className="kv"><span>escrowed</span><b className="mono">{weiToGen(sel.funded)} GEN</b></div>
+                    <div className="kv"><span>remaining in escrow</span><b className="mono">{weiToGen(sel.remaining_escrow_balance)} GEN</b></div>
+                    <div className="kv"><span>claimable to seller</span><b className="mono">{weiToGen(sel.seller_claimable)} GEN</b></div>
+                    <div className="kv"><span>refundable to buyer</span><b className="mono">{weiToGen(sel.buyer_claimable)} GEN</b></div>
+                    <div className="kv"><span>released to seller</span><b className="mono">{weiToGen(sel.released)} GEN</b></div>
+                    <div className="kv"><span>refunded to buyer</span><b className="mono">{weiToGen(sel.refunded)} GEN</b></div>
+                    <div className="kv"><span>unallocated</span><b className="mono">{weiToGen(sel.unallocated_escrow)} GEN</b></div>
                     <div className="kv"><span>witness</span><b>{sel.witness_required ? "required" : "optional"}</b></div>
                     <div className="kv"><span>doc sha256</span><b className="mono">{sel.milestones_doc_sha256 ? sel.milestones_doc_sha256.slice(0, 10) + "…" : "—"}</b></div>
                   </div>

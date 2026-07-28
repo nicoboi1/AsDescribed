@@ -118,15 +118,36 @@ function addr(a: string): unknown {
 // ── views ─────────────────────────────────────────────────────────────────
 export const getPlatformSummary = () =>
   read<PlatformSummary>("platform_summary", []);
-export const getDeal = (dealId: string) => read<DealView>("deal", [dealId]);
+export const getDeal = async (dealId: string): Promise<DealView> => {
+  const deal = await read<DealView>("deal", [dealId]);
+  return {
+    ...deal,
+    // Backward-compatible fallbacks for the previous Bradbury deployment.
+    remaining_escrow_balance:
+      deal.remaining_escrow_balance ?? deal.escrow_balance ?? 0,
+    unallocated_escrow:
+      deal.unallocated_escrow ??
+      Math.max(0, Number(deal.funded ?? 0) - Number(deal.allocated ?? 0)),
+  };
+};
 export const getMilestones = (dealId: string) =>
   read<MilestoneView[]>("milestones_of", [dealId]);
 export const getParticipants = (dealId: string) =>
   read<ParticipantsView>("participants", [dealId]);
 export const getRoleOf = (dealId: string, address: string) =>
   read<string>("role_of", [dealId, addr(address)]);
-export const getDispute = (disputeId: string) =>
-  read<DisputeView>("dispute", [disputeId]);
+export const getDispute = async (disputeId: string): Promise<DisputeView> => {
+  const dispute = await read<DisputeView>("dispute", [disputeId]);
+  return {
+    ...dispute,
+    bond_total: dispute.bond_total ?? dispute.bond ?? 0,
+    bond_claimable:
+      dispute.bond_claimable ??
+      (dispute.bond_claimed ? 0 : dispute.bond ?? 0),
+    bond_claimable_recipient:
+      dispute.bond_claimable_recipient ?? dispute.bond_recipient ?? "",
+  };
+};
 export const getTranche = (dealId: string, idx: number) =>
   read<Record<string, unknown>>("tranche_state", [dealId, idx]);
 

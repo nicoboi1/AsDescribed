@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import s from "./Actions.module.css";
 import * as svc from "../contractService";
 import type { DealView, Hex, MilestoneView } from "../types";
+import { weiToGen } from "../lib";
 
 interface Props {
   account: Hex;
@@ -91,7 +92,7 @@ export function Actions({ account, deal, milestones, busy, run, onDisputeOpened 
           disabled={!can || deal.seller_claimable <= 0}
           onClick={() => run("Claiming seller payout", () => svc.claimSellerPayout(account, id))}
         >
-          Claim seller payout
+          Claim seller payout ({weiToGen(deal.seller_claimable)} GEN)
         </button>
       </Group>
 
@@ -114,7 +115,7 @@ export function Actions({ account, deal, milestones, busy, run, onDisputeOpened 
           disabled={!can || deal.buyer_claimable <= 0}
           onClick={() => run("Claiming buyer refund", () => svc.claimBuyerRefund(account, id))}
         >
-          Claim buyer refund
+          Claim buyer refund ({weiToGen(deal.buyer_claimable)} GEN)
         </button>
       </Group>
 
@@ -201,7 +202,7 @@ export function Actions({ account, deal, milestones, busy, run, onDisputeOpened 
             )
           }
         >
-          Recover after 7-day timeout
+          Recover timed-out dispute
         </button>
         <input
           className={`${s.in} mono`}
@@ -218,7 +219,7 @@ export function Actions({ account, deal, milestones, busy, run, onDisputeOpened 
             )
           }
         >
-          Claim awarded bond
+          Claim dispute bond
         </button>
       </Group>
 
